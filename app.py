@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
 from scipy.stats import poisson
 from nba_api.stats.static import players, teams
@@ -7,37 +8,25 @@ from nba_api.stats.endpoints import playergamelog, leaguedashteamstats
 
 # --- 1. POMOĆNE FUNKCIJE ---
 def check_b2b(log):
-    """Provjerava je li igrač igrao jučer na temelju njegovog loga."""
     try:
         if log.empty: return False
         last_game_str = log.iloc[0]['GAME_DATE']
-        # Format datuma u NBA API je 'FEB 07, 2024'
         last_game_date = datetime.strptime(last_game_str, '%b %d, %Y').date()
         yesterday = datetime.now().date() - timedelta(days=1)
         return last_game_date == yesterday
-    except:
-        return False
+    except: return False
 
 def get_position_factor(opponent, position):
-    """Vraća faktor težine na temelju pozicije i protivnika (DvP)."""
-    # Primjer elite obrane protiv određenih pozicija
-    elite_vs_centers = ["Timberwolves", "Celtics", "Heat", "76ers"]
-    bad_vs_centers = ["Wizards", "Pistons", "Hornets", "Spurs"]
+    elite_def = ["Timberwolves", "Celtics", "Heat", "76ers", "Thunder", "Magic"]
+    bad_def = ["Wizards", "Pistons", "Hornets", "Spurs", "Trail Blazers"]
     
-    if position == "C":
-        if any(team in opponent for team in elite_vs_centers): return 0.88
-        if any(team in opponent for team in bad_vs_centers): return 1.12
-    
-    # Možeš dodati i za PG (npr. protiv Jrue Holiday-a ili Derrick White-a)
-    elite_vs_guards = ["Celtics", "Thunder", "Magic"]
-    if position == "PG" or position == "SG":
-        if any(team in opponent for team in elite_vs_guards): return 0.90
-        
+    if any(team in opponent for team in elite_def): return 0.90
+    if any(team in opponent for team in bad_def): return 1.10
     return 1.0
 
 # --- 2. UI POSTAVKE ---
-st.set_page_config(page_title="NBA Pro Analytics", layout="wide")
-st.title("🏀 NBA Pro Analytics (B2B & DvP Mode)")
+st.set_page_config(page_title="NBA Pro Analytics v8.0", layout="wide")
+st.title("🏀 NBA Pro Analytics (Precision & Confidence Mode)")
 
 nba_teams = sorted([team['nickname'] for team in teams.get_teams()])
 positions = ["PG", "SG", "SF", "PF", "C"]
@@ -45,33 +34,28 @@ positions = ["PG", "SG", "SF", "PF", "C"]
 if 'batch_list' not in st.session_state:
     st.session_state.batch_list = []
 
-# --- 3. SIDEBAR ---
 with st.sidebar:
-    st.header("⚙️ Dodaj Igrača")
-    ime = st.text_input("Ime igrača", "Joel Embiid")
+    st.header("⚙️ Postavke")
+    ime = st.text_input("Ime igrača", "Amen Thompson")
     pozicija = st.selectbox("Pozicija", positions)
     moj_tim = st.selectbox("Njegov tim", nba_teams)
     protivnik = st.selectbox("Protivnik", nba_teams)
-    granica = st.number_input("Granica", value=25.5)
+    granica = st.number_input("Granica", value=13.5)
     
     if st.button("➕ Dodaj na listu"):
         st.session_state.batch_list.append({
             "ime": ime, "poz": pozicija, "tim": moj_tim, "protivnik": protivnik, "granica": granica
         })
-        st.success(f"Dodan {ime}!")
 
-    if st.button("🗑️ Očisti listu"):
+    if st.button("🗑️ Očisti sve"):
         st.session_state.batch_list = []
         st.rerun()
 
-# --- 4. ANALIZA ---
+# --- 3. GLAVNA ANALIZA ---
 if st.session_state.batch_list:
-    st.subheader("📋 Lista za obradu")
-    st.write(pd.DataFrame(st.session_state.batch_list))
-    
-    if st.button("🚀 POKRENI ANALIZU"):
+    if st.button("🚀 POKRENI PRECIZNU ANALIZU"):
         results = []
-        with st.spinner('Dohvaćam napredne podatke...'):
+        with st.spinner('Kalibriram model i računam volume trend...'):
             stats_df = leaguedashteamstats.LeagueDashTeamStats(measure_type_detailed_defense='Advanced').get_data_frames()[0]
             l_pace = stats_df['PACE'].mean()
             l_def = stats_df['DEF_RATING'].mean()
@@ -82,39 +66,57 @@ if st.session_state.batch_list:
                     if not p_search: continue
                     
                     log = playergamelog.PlayerGameLog(player_id=p_search[0]['id'], season='2024-25').get_data_frames()[0]
+                    if log.empty: continue
+
+                    # --- KALIBRACIJA PRECIZNOSTI ---
+                    # 1. Median Minutes (otpornije na blowout)
+                    proj_min = log['MIN'].median()
                     
-                    # Provjera B2B faktora
-                    is_b2b = check_b2b(log)
-                    b2b_multiplier = 0.90 if is_b2b else 1.0
-                    
-                    # DvP faktor
+                    # 2. Recent Volume Trend (Zadnjih 5 vs zadnjih 20 utakmica po broju šuteva)
+                    recent_fga = log.head(5)['FGA'].mean()
+                    season_fga = log.head(20)['FGA'].mean()
+                    volume_factor = max(0.85, min(1.15, recent_fga / season_fga)) if season_fga > 0 else 1.0
+
+                    # 3. Konstantnost (Confidence Score)
+                    # Što je veća varijacija poena, to je niži confidence
+                    pts_std = log.head(15)['PTS'].std()
+                    pts_mean = log.head(15)['PTS'].mean()
+                    cv = pts_std / pts_mean if pts_mean > 0 else 1
+                    confidence = max(0, min(100, int(100 * (1 - cv))))
+
+                    # 4. Standardni faktori (B2B, DvP, Pace, Def)
+                    b2b_multiplier = 0.90 if check_b2b(log) else 1.0
                     dvp_multiplier = get_position_factor(p['protivnik'], p['poz'])
+                    eff = (log.head(15)['PTS'] / log.head(15)['MIN'].replace(0, 1)).mean()
                     
-                    # Efikasnost (PTS po minuti)
-                    eff = (log.head(10)['PTS'] / log.head(10)['MIN'].replace(0, 1)).mean()
-                    proj_min = log['MIN'].mean()
-                    
-                    # Dohvaćanje timskog tempa i obrane
                     t_stats = stats_df[stats_df['TEAM_NAME'].str.contains(p['tim'])].iloc[0]
                     o_stats = stats_df[stats_df['TEAM_NAME'].str.contains(p['protivnik'])].iloc[0]
-                    
                     pace_f = ((t_stats['PACE'] * o_stats['PACE']) / l_pace) / l_pace
                     def_f = o_stats['DEF_RATING'] / l_def
 
-                    # Finalna kalkulacija
-                    adj_mu = proj_min * eff * pace_f * def_f * b2b_multiplier * dvp_multiplier
+                    # --- KONAČNA PROJEKCIJA ---
+                    adj_mu = proj_min * eff * pace_f * def_f * b2b_multiplier * dvp_multiplier * volume_factor
                     prob_over = (1 - poisson.cdf(p['granica'] - 0.5, adj_mu)) * 100
 
                     results.append({
                         "Igrač": p['ime'],
-                        "B2B": "DA ⚠️" if is_b2b else "NE",
-                        "DvP": f"{dvp_multiplier}x",
+                        "Granica": p['granica'],
                         "Proj. Pts": round(adj_mu, 1),
-                        "Over %": round(prob_over, 1),
-                        "Preporuka": "🔥 OVER" if prob_over > 65 else ("❄️ UNDER" if prob_over < 35 else "⚖️ NO BET")
+                        "Over %": f"{round(prob_over, 1)}%",
+                        "Confidence": f"{confidence}%",
+                        "Volume": "⬆️ Raste" if volume_factor > 1.05 else ("⬇️ Pada" if volume_factor < 0.95 else "➡️ Stabilan"),
+                        "Preporuka": "✅ OVER" if prob_over > 65 and confidence > 60 else ("❌ UNDER" if prob_over < 35 and confidence > 60 else "⚠️ RISKANTNO")
                     })
                 except Exception as e:
                     st.error(f"Greška kod {p['ime']}: {e}")
 
         if results:
-            st.table(pd.DataFrame(results))
+            res_df = pd.DataFrame(results)
+            st.table(res_df)
+            
+            st.markdown("""
+            **Upute za čitanje rezultata:**
+            - **Volume:** Govori ti uzima li igrač više šuteva u zadnje vrijeme nego inače.
+            - **Confidence:** Ako je ispod 50%, igrač previše oscilira (jednu zabije 5, drugu 25) i statistika mu nije pouzdana.
+            - **Preporuka:** Program preporučuje par samo ako su i vjerojatnost i konstantnost (Confidence) visoki.
+            """)
