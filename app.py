@@ -64,6 +64,60 @@ with st.sidebar:
 
 # --- 3. PRO ANALIZA ---
 if st.session_state.batch_list:
-    st.dataframe(pd.DataFrame(st.session_state.batch_list))
+    st.dataframe(pd.DataFrame(st.session_state.batch_list), use_container_width=True)
     
-    if st.button("🚀 POKRENI BEAST MODE ANAL
+    if st.button("🚀 POKRENI BEAST MODE ANALIZU"):
+        results = []
+        with st.spinner('Beast Mode: Računam težinske prosjeke i home/away faktore...'):
+            stats_df = leaguedashteamstats.LeagueDashTeamStats(measure_type_detailed_defense='Advanced').get_data_frames()[0]
+            l_pace = stats_df['PACE'].mean()
+            l_def = stats_df['DEF_RATING'].mean()
+
+            for p in st.session_state.batch_list:
+                try:
+                    p_id = players.find_players_by_full_name(p['Ime'])[0]['id']
+                    log = playergamelog.PlayerGameLog(player_id=p_id, season='2024-25').get_data_frames()[0]
+
+                    # A) Napredna Minutaža (Blowout penal)
+                    base_min = log['MIN'].median()
+                    if p['Spread'] > 12: base_min *= 0.90 
+
+                    # B) Težinska Efikasnost (Recent Form)
+                    w_ppm = calculate_weighted_ppm(log)
+
+                    # C) Home/Away Split
+                    ha_factor = get_home_away_factor(log, p['Doma'])
+
+                    # D) Matchup & Tempo
+                    t_stats = stats_df[stats_df['TEAM_NAME'].str.contains(p['Tim'])].iloc[0]
+                    o_stats = stats_df[stats_df['TEAM_NAME'].str.contains(p['Protivnik'])].iloc[0]
+                    pace_f = ((t_stats['PACE'] * o_stats['PACE']) / l_pace) / l_pace
+                    def_f = o_stats['DEF_RATING'] / l_def
+
+                    # E) Volumen Šuta (Zadnjih 5 utakmica)
+                    vol_f = max(0.9, min(1.1, log.head(5)['FGA'].mean() / log.head(20)['FGA'].mean()))
+
+                    # --- KONAČNA FORMULA ---
+                    final_proj = base_min * w_ppm * pace_f * def_f * ha_factor * vol_f
+                    
+                    # Confidence Score
+                    confidence = int(max(0, min(100, 100 * (1 - (log['PTS'].std() / log['PTS'].mean())))))
+                    prob_over = (1 - poisson.cdf(p['Granica'] - 0.5, final_proj)) * 100
+
+                    results.append({
+                        "Igrač": p['Ime'],
+                        "Granica": p['Granica'],
+                        "Proj": round(final_proj, 1),
+                        "Over %": f"{round(prob_over, 1)}%",
+                        "Conf": f"{confidence}%",
+                        "TIP": "✅ OVER" if prob_over > 68 and confidence > 62 else ("❌ UNDER" if prob_over < 32 and confidence > 62 else "🚫 PASS")
+                    })
+                except Exception as e:
+                    st.error(f"Greška kod {p.get('Ime', 'Nepoznato')}: {e}")
+
+        if results:
+            st.divider()
+            st.subheader("📊 Beast Mode Rezultati")
+            st.table(pd.DataFrame(results))
+            vrijeme = datetime.now().strftime("%d.%m.%Y. u %H:%M:%S")
+            st.caption(f"🕒 Analiza završena: {vrijeme}")
