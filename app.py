@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime
 from nba_api.stats.endpoints import playergamelog, leaguedashteamstats
 from nba_api.stats.static import players
 import traceback
@@ -9,77 +8,125 @@ import traceback
 st.set_page_config(page_title="NBA Points Predictor Pro", layout="wide")
 
 # -----------------------------
-# CACHE — TEAM STATS
+# TEAM STATS (robust columns)
 # -----------------------------
 
 @st.cache_data(ttl=3600)
 def get_team_stats():
+
     df = leaguedashteamstats.LeagueDashTeamStats().get_data_frames()[0]
-    return df[['TEAM_ID','TEAM_NAME','PACE','DEF_RATING','OFF_RATING']]
+    cols = df.columns.tolist()
+
+    def find_col(possible):
+        for c in cols:
+            if c.upper() in possible:
+                return c
+        return None
+
+    pace_col = find_col(["PACE"])
+    def_col  = find_col(["DEF_RATING","DEFRTG"])
+    off_col  = find_col(["OFF_RATING","OFFRTG"])
+
+    if pace_col is None:
+        df["PACE_FIX"] = 100
+        pace_col = "PACE_FIX"
+
+    if def_col is None:
+        df["DEF_FIX"] = 112
+        def_col = "DEF_FIX"
+
+    if off_col is None:
+        df["OFF_FIX"] = 112
+        off_col = "OFF_FIX"
+
+    out = df[[
+        "TEAM_ID",
+        "TEAM_NAME",
+        pace_col,
+        def_col,
+        off_col
+    ]].rename(columns={
+        pace_col:"PACE",
+        def_col:"DEF_RATING",
+        off_col:"OFF_RATING"
+    })
+
+    return out
+
 
 TEAM_STATS = get_team_stats()
-LEAGUE_PACE = TEAM_STATS['PACE'].mean()
-LEAGUE_DEF = TEAM_STATS['DEF_RATING'].mean()
+LEAGUE_PACE = TEAM_STATS["PACE"].mean()
+LEAGUE_DEF = TEAM_STATS["DEF_RATING"].mean()
 
 # -----------------------------
 # MINUTES PARSER
 # -----------------------------
 
-def parse_minutes_col(min_series: pd.Series) -> pd.Series:
-    def parse_min(x):
+def parse_minutes_col(min_series):
+
+    def parse_val(x):
         if pd.isna(x):
             return np.nan
+
         try:
             return float(x)
         except:
             pass
-        if isinstance(x, str) and ":" in x:
+
+        if isinstance(x,str) and ":" in x:
             try:
-                mm, ss = x.split(":")
+                mm,ss = x.split(":")
                 return float(mm) + float(ss)/60
             except:
                 return np.nan
+
         return np.nan
-    return min_series.apply(parse_min)
+
+    return min_series.apply(parse_val)
+
 
 def safe_sort_log(log):
     log = log.copy()
-    log['GAME_DATE'] = pd.to_datetime(log['GAME_DATE'])
-    return log.sort_values('GAME_DATE', ascending=False).reset_index(drop=True)
+    log["GAME_DATE"] = pd.to_datetime(log["GAME_DATE"])
+    return log.sort_values("GAME_DATE", ascending=False).reset_index(drop=True)
 
 # -----------------------------
-# FEATURE ENGINEERING
+# FEATURES
 # -----------------------------
 
 def recency_weights(n):
     return np.exp(-np.arange(n)/4)
 
+
 def compute_ppm_features(log):
+
     log = safe_sort_log(log)
-    log['MIN'] = parse_minutes_col(log['MIN'])
-    log = log.dropna(subset=['MIN'])
-    log = log[log['MIN'] > 3]
+    log["MIN"] = parse_minutes_col(log["MIN"])
+    log = log.dropna(subset=["MIN"])
+    log = log[log["MIN"] > 3]
 
     if len(log) == 0:
         return 0.8, 0.25
 
-    ppm = log['PTS'] / log['MIN']
+    ppm = log["PTS"] / log["MIN"]
     w = recency_weights(len(ppm))
 
     wppm = np.average(ppm, weights=w)
     return float(wppm), float(ppm.std())
 
+
 def predict_minutes(log):
+
     log = safe_sort_log(log)
-    log['MIN'] = parse_minutes_col(log['MIN'])
-    mins = log['MIN'].dropna()
+    log["MIN"] = parse_minutes_col(log["MIN"])
+    mins = log["MIN"].dropna()
 
     if len(mins) == 0:
         return 28
 
     last5 = mins.head(5)
-
     med = last5.median()
+
     if len(last5) >= 2:
         trend = last5.iloc[0] - last5.iloc[-1]
     else:
@@ -88,20 +135,25 @@ def predict_minutes(log):
     pred = med + trend * 0.25
     return float(np.clip(pred, 12, 40))
 
+
 def fatigue_factor(log):
+
     log = safe_sort_log(log)
+
     if len(log) < 3:
         return 1.0
 
-    d0 = log.loc[0,'GAME_DATE']
-    d2 = log.loc[2,'GAME_DATE']
+    d0 = log.loc[0,"GAME_DATE"]
+    d2 = log.loc[2,"GAME_DATE"]
 
     if (d0 - d2).days <= 3:
         return 0.94
 
     return 1.0
 
+
 def pace_factor(team, opp):
+
     try:
         t = TEAM_STATS[TEAM_STATS.TEAM_NAME == team].iloc[0]
         o = TEAM_STATS[TEAM_STATS.TEAM_NAME == opp].iloc[0]
@@ -109,7 +161,9 @@ def pace_factor(team, opp):
     except:
         return 1.0
 
+
 def defense_factor(opp):
+
     try:
         d = TEAM_STATS[TEAM_STATS.TEAM_NAME == opp].iloc[0].DEF_RATING
         return d / LEAGUE_DEF
@@ -117,10 +171,11 @@ def defense_factor(opp):
         return 1.0
 
 # -----------------------------
-# MONTE CARLO MODEL
+# MONTE CARLO
 # -----------------------------
 
 def simulate_points(mu_minutes, mu_ppm, ppm_sigma, line):
+
     sims = 20000
 
     min_sigma = max(2.5, mu_minutes * 0.12)
@@ -135,21 +190,24 @@ def simulate_points(mu_minutes, mu_ppm, ppm_sigma, line):
 
     prob_over = (pts > line).mean() * 100
     mean_proj = pts.mean()
-    p10 = np.percentile(pts, 10)
-    p90 = np.percentile(pts, 90)
+    p10 = np.percentile(pts,10)
+    p90 = np.percentile(pts,90)
 
     return prob_over, mean_proj, p10, p90
 
 # -----------------------------
-# DATA FETCH
+# PLAYER DATA
 # -----------------------------
 
 @st.cache_data(ttl=1800)
 def get_player_log(player_name):
+
     pl = players.find_players_by_full_name(player_name)
+
     if not pl:
         return None
-    pid = pl[0]['id']
+
+    pid = pl[0]["id"]
     df = playergamelog.PlayerGameLog(player_id=pid).get_data_frames()[0]
     return df
 
@@ -159,17 +217,18 @@ def get_player_log(player_name):
 
 st.title("NBA Points Predictor — Advanced Model")
 
-st.write("Unesi igrače (ime, tim, protivnik, linija).")
-
 rows = st.number_input("Broj igrača", 1, 20, 3)
 
 inputs = []
+
 for i in range(rows):
     c1,c2,c3,c4 = st.columns(4)
+
     name = c1.text_input(f"Igrač {i+1}")
     team = c2.text_input("Tim", key=f"team{i}")
-    opp = c3.text_input("Protivnik", key=f"opp{i}")
+    opp  = c3.text_input("Protivnik", key=f"opp{i}")
     line = c4.number_input("Granica", value=20.5, key=f"line{i}")
+
     inputs.append((name,team,opp,line))
 
 # -----------------------------
@@ -186,6 +245,7 @@ if st.button("Analiziraj"):
             continue
 
         try:
+
             log = get_player_log(name)
 
             if log is None or len(log) == 0:
@@ -193,14 +253,14 @@ if st.button("Analiziraj"):
                 continue
 
             log = safe_sort_log(log)
-            log['MIN'] = parse_minutes_col(log['MIN'])
+            log["MIN"] = parse_minutes_col(log["MIN"])
 
             mu_minutes = predict_minutes(log)
             mu_ppm, ppm_sigma = compute_ppm_features(log)
 
             f_fat = fatigue_factor(log)
             f_pace = pace_factor(team, opp)
-            f_def = defense_factor(opp)
+            f_def  = defense_factor(opp)
 
             adj_ppm = mu_ppm * f_pace * f_def * f_fat
 
@@ -232,6 +292,7 @@ if st.button("Analiziraj"):
     if results:
 
         df = pd.DataFrame(results).sort_values("P_over_pct", ascending=False)
+
         st.dataframe(df, use_container_width=True)
 
         st.subheader("Signal")
