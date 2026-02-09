@@ -3,5 +3,6 @@ pandas
 numpy
 scipy
 nba_api
+requests
 lxml
 html5lib
