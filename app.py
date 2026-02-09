@@ -103,9 +103,9 @@ with st.expander("➕ DODAJ NOVOG IGRAČA ZA ANALIZU", expanded=True):
         })
         st.rerun()
 
-# --- 3. CORE ANALIZA ---
+# --- 3. CORE ANALIZA (VERZIJA S JASNIM SIGNALIMA) ---
 if 'batch_list' in st.session_state and st.session_state.batch_list:
-    if st.button("🚀 POKRENI PRO ANALIZU"):
+    if st.button("🚀 POKRENI FILTRIRANU ANALIZU"):
         stats_df = leaguedashteamstats.LeagueDashTeamStats(measure_type_detailed_defense='Advanced').get_data_frames()[0]
         l_pace = stats_df['PACE'].mean()
         l_def = stats_df['DEF_RATING'].mean()
@@ -117,12 +117,10 @@ if 'batch_list' in st.session_state and st.session_state.batch_list:
                 p_id = p_search[0]['id']
                 log = playergamelog.PlayerGameLog(player_id=p_id, season='2024-25').get_data_frames()[0]
 
-                # --- NAPREDNI FAKTORI ---
+                # --- KALKULACIJE ---
                 fatigue_f = check_schedule_fatigue(log)
                 dvp_f = get_dvp_2_0(p['Protivnik'], p['Poz'])
                 w_ppm = calculate_weighted_ppm(log)
-                
-                # Osnovne metrike
                 base_min = log['MIN'].median()
                 if p['Spread'] > 12: base_min *= 0.90
                 
@@ -131,33 +129,35 @@ if 'batch_list' in st.session_state and st.session_state.batch_list:
                 pace_f = ((t_stats['PACE'] * o_stats['PACE']) / l_pace) / l_pace
                 def_f = o_stats['DEF_RATING'] / l_def
                 
-                # Finalna projekcija
                 final_proj = base_min * w_ppm * pace_f * def_f * fatigue_f * dvp_f
-                
-                # Value Finder (Kvota 1.85 -> Prag 54.05%)
                 prob_over = (1 - poisson.cdf(p['Granica'] - 0.5, final_proj)) * 100
-                ev_status = "✅ EV+" if prob_over > 56 else ("❌ Negative EV" if prob_over < 52 else "➖ Neutral")
-                
                 confidence = int(max(0, min(100, 100 * (1 - (log['PTS'].std() / log['PTS'].mean())))))
 
-                # --- PRIKAZ ---
-                with st.container():
-                    colA, colB, colC = st.columns([1, 1, 2])
+                # --- NOVI SUSTAV SIGNALIZACIJE ---
+                if prob_over > 65 and confidence > 65 and fatigue_f >= 1.0:
+                    boja = "green"
+                    status = "🌟 ELITNI OVER (Snažan signal)"
+                elif prob_over < 35 and confidence > 65:
+                    boja = "blue"
+                    status = "❄️ ELITNI UNDER (Snažan signal)"
+                elif fatigue_f < 1.0 and prob_over < 50:
+                    boja = "orange"
+                    status = "⚠️ UMOR + UNDER (Dobar Value)"
+                else:
+                    boja = "grey"
+                    status = "🚫 RIZIČNO / PASS"
+
+                # --- POJEDNOSTAVLJENI PRIKAZ ---
+                with st.expander(f"{status} - {p['Ime']}", expanded=(boja != "grey")):
+                    colA, colB = st.columns([1, 2])
                     with colA:
-                        st.metric(f"🏀 {p['Ime']}", f"{round(final_proj, 1)} pts")
-                        st.write(f"**Value:** {ev_status}")
+                        st.write(f"**Prognoza:** {round(final_proj, 1)} pts")
+                        st.write(f"**Šansa za Over:** {round(prob_over, 1)}%")
+                        st.write(f"**Pouzdanost:** {confidence}%")
+                        if fatigue_f < 1.0: st.error("IGRAČ JE UMORAN (3 u 4 ili B2B)")
                     with colB:
-                        st.write(f"Vjerojatnost: **{round(prob_over, 1)}%**")
-                        st.write(f"Confidence: {confidence}%")
-                        if fatigue_f < 1.0: st.warning("⚠️ Schedule Fatigue!")
-                    with colC:
                         last_10 = log.head(10).iloc[::-1]
                         st.line_chart(pd.DataFrame({'PTS': last_10['PTS'].values, 'Line': [p['Granica']]*10}))
-                st.divider()
-
+                
             except Exception as e:
                 st.error(f"Greška kod {p['Ime']}: {e}")
-
-    if st.button("🗑️ Resetiraj"):
-        st.session_state.batch_list = []
-        st.rerun()
