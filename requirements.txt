@@ -1,7 +1,7 @@
 streamlit
 pandas
 numpy
-requests
-beautifulsoup4
 scipy
 nba_api
+lxml
+html5lib
