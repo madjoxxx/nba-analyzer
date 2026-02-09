@@ -1,161 +1,234 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import requests
-from datetime import datetime, timedelta
-from scipy.stats import poisson
-from nba_api.stats.static import players, teams
+from datetime import datetime
 from nba_api.stats.endpoints import playergamelog, leaguedashteamstats
+from nba_api.stats.static import players, teams
+import traceback
 
-# --- 1. POMOĆNE FUNKCIJE ---
-def calculate_weighted_ppm(log):
-    if len(log) < 5: return (log['PTS'] / log['MIN'].replace(0,1)).mean()
-    recent = log.head(5)
-    season = log.tail(len(log)-5)
-    ppm_recent = (recent['PTS'] / recent['MIN'].replace(0,1)).mean()
-    ppm_season = (season['PTS'] / season['MIN'].replace(0,1)).mean()
-    return (ppm_recent * 0.7) + (ppm_season * 0.3)
+st.set_page_config(page_title="NBA Points Predictor Pro", layout="wide")
 
-def check_schedule_fatigue(log):
-    """Blaži kriterij: Samo ekstremni umor (3 u 4 dana)."""
-    try:
-        if len(log) < 3: return 1.0
-        log['GAME_DATE_DT'] = pd.to_datetime(log['GAME_DATE'])
-        last_game = log.iloc[0]['GAME_DATE_DT']
-        three_games_ago = log.iloc[2]['GAME_DATE_DT']
-        diff = (last_game - three_games_ago).days
-        
-        # Samo ako je baš 3 utakmice u 4 dana (ekstremni umor)
-        if diff <= 4:
-            return 0.94 # Blaži penal od 6%
-        return 1.0
-    except: return 1.0
-
-def get_dvp_2_0(opponent_team, position):
-    rim_protectors = ["Timberwolves", "Celtics", "Lakers", "Thunder", "Cavaliers"]
-    perimeter_defenders = ["Heat", "Magic", "Knicks", "Pelicans", "76ers"]
-    if position in ["C", "PF"] and any(t in opponent_team for t in rim_protectors):
-        return 0.90
-    if position in ["PG", "SG"] and any(t in opponent_team for t in perimeter_defenders):
-        return 0.92
-    return 1.0
+# -----------------------------
+# Utilities
+# -----------------------------
 
 @st.cache_data(ttl=3600)
-def get_injury_report():
-    try:
-        url = "https://www.cbssports.com/nba/injuries/"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers, timeout=10)
-        tables = pd.read_html(response.text)
-        df = pd.concat(tables, ignore_index=True)
-        cols = ['Player', 'Position', 'Updated', 'Injury', 'Status']
-        return df[[c for c in cols if c in df.columns]]
-    except: return None
+def get_team_stats():
+    df = leaguedashteamstats.LeagueDashTeamStats().get_data_frames()[0]
+    return df[['TEAM_ID','TEAM_NAME','PACE','DEF_RATING','OFF_RATING']]
 
-# --- 2. UI POSTAVKE ---
-st.set_page_config(page_title="NBA AI BEAST V11.2", layout="wide")
+TEAM_STATS = get_team_stats()
+LEAGUE_PACE = TEAM_STATS['PACE'].mean()
+LEAGUE_DEF = TEAM_STATS['DEF_RATING'].mean()
 
-with st.sidebar:
-    st.header("🚑 Injury Watch")
-    injuries = get_injury_report()
-    if injuries is not None:
-        search = st.text_input("Traži ozljedu")
-        if search:
-            st.dataframe(injuries[injuries['Player'].str.contains(search, case=False, na=False)], hide_index=True)
-        else:
-            st.dataframe(injuries.head(10), hide_index=True)
-
-st.title("🔥 NBA AI Beast V11.2 (Optimized)")
-
-if 'batch_list' not in st.session_state:
-    st.session_state.batch_list = []
-if 'analysis_done' not in st.session_state:
-    st.session_state.analysis_done = False
-
-# Unos igrača
-with st.expander("➕ DODAJ NOVOG IGRAČA", expanded=not st.session_state.analysis_done):
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        ime = st.text_input("Ime igrača")
-        poz = st.selectbox("Pozicija", ["PG", "SG", "SF", "PF", "C"])
-    with c2:
-        nba_teams = sorted([t['nickname'] for t in teams.get_teams()])
-        tim = st.selectbox("Njegov tim", nba_teams)
-        protivnik = st.selectbox("Protivnik", nba_teams)
-    with c3:
-        granica = st.number_input("Granica", value=18.5)
-        lokacija = st.radio("Lokacija", ["Doma", "Vani"])
-        spread = st.slider("Spread", 0, 20, 5)
-
-    if st.button("➕ DODAJ NA LISTU"):
-        if ime:
-            st.session_state.batch_list.append({
-                "Ime": ime, "Poz": poz, "Tim": tim, "Protivnik": protivnik, 
-                "Granica": granica, "Doma": lokacija == "Doma", "Spread": spread
-            })
-            st.session_state.analysis_done = False
-            st.rerun()
-
-# --- 3. AKCIJSKE TIPKE ---
-col_run, col_clear = st.columns(2)
-with col_run:
-    run_btn = st.button("🚀 POKRENI ANALIZU", use_container_width=True)
-with col_clear:
-    if st.button("🗑️ OBRIŠI SVE (CLEAR)", use_container_width=True):
-        st.session_state.batch_list = []
-        st.session_state.analysis_done = False
-        st.rerun()
-
-# --- 4. PRIKAZ REZULTATA ---
-if st.session_state.batch_list:
-    if run_btn:
-        st.session_state.analysis_done = True
-        
-    if st.session_state.analysis_done:
-        stats_df = leaguedashteamstats.LeagueDashTeamStats(measure_type_detailed_defense='Advanced').get_data_frames()[0]
-        l_pace = stats_df['PACE'].mean()
-        l_def = stats_df['DEF_RATING'].mean()
-
-        for p in st.session_state.batch_list:
+def parse_minutes_col(min_series: pd.Series) -> pd.Series:
+    def parse_min(x):
+        if pd.isna(x):
+            return np.nan
+        try:
+            return float(x)
+        except:
+            pass
+        if isinstance(x, str) and ":" in x:
             try:
-                p_search = players.find_players_by_full_name(p['Ime'])
-                if not p_search: continue
-                p_id = p_search[0]['id']
-                log = playergamelog.PlayerGameLog(player_id=p_id, season='2024-25').get_data_frames()[0]
+                mm, ss = x.split(":")
+                return float(mm) + float(ss)/60
+            except:
+                return np.nan
+        return np.nan
+    return min_series.apply(parse_min)
 
-                fatigue_f = check_schedule_fatigue(log)
-                dvp_f = get_dvp_2_0(p['Protivnik'], p['Poz'])
-                w_ppm = calculate_weighted_ppm(log)
-                base_min = log['MIN'].median()
-                if p['Spread'] > 12: base_min *= 0.90
-                
-                t_stats = stats_df[stats_df['TEAM_NAME'].str.contains(p['Tim'])].iloc[0]
-                o_stats = stats_df[stats_df['TEAM_NAME'].str.contains(p['Protivnik'])].iloc[0]
-                pace_f = ((t_stats['PACE'] * o_stats['PACE']) / l_pace) / l_pace
-                def_f = o_stats['DEF_RATING'] / l_def
-                
-                final_proj = base_min * w_ppm * pace_f * def_f * fatigue_f * dvp_f
-                prob_over = (1 - poisson.cdf(p['Granica'] - 0.5, final_proj)) * 100
-                confidence = int(max(0, min(100, 100 * (1 - (log['PTS'].std() / log['PTS'].mean())))))
+def recency_weights(n):
+    # exponential decay
+    return np.exp(-np.arange(n)/4)
 
-                # Signalni sustav
-                if prob_over > 65 and confidence > 60:
-                    status = "🟢 ELITNI OVER"
-                    expand = True
-                elif prob_over < 35 and confidence > 60:
-                    status = "🔵 ELITNI UNDER"
-                    expand = True
-                else:
-                    status = "⚪ PROVJERI DETALJE"
-                    expand = False
+def safe_sort_log(log):
+    log = log.copy()
+    log['GAME_DATE'] = pd.to_datetime(log['GAME_DATE'])
+    return log.sort_values('GAME_DATE', ascending=False).reset_index(drop=True)
 
-                with st.expander(f"{status} - {p['Ime']} ({round(prob_over, 1)}%)", expanded=expand):
-                    colA, colB = st.columns([1, 2])
-                    with colA:
-                        st.metric("Prognoza", f"{round(final_proj, 1)} pts")
-                        st.write(f"Conf: {confidence}%")
-                        if fatigue_f < 1.0: st.warning("⚠️ Umoran (3 u 4)")
-                    with colB:
-                        last_10 = log.head(10).iloc[::-1]
-                        st.line_chart(pd.DataFrame({'PTS': last_10['PTS'].values, 'Line': [p['Granica']]*10}))
-            except: continue
+# -----------------------------
+# Feature Engineering
+# -----------------------------
+
+def compute_ppm_features(log):
+    log = safe_sort_log(log)
+    log['MIN'] = parse_minutes_col(log['MIN'])
+
+    log = log.dropna(subset=['MIN'])
+    log = log[log['MIN'] > 3]
+
+    ppm = log['PTS'] / log['MIN']
+
+    if len(ppm) == 0:
+        return 0.8, 0.2
+
+    w = recency_weights(len(ppm))
+    wppm = np.average(ppm, weights=w)
+
+    return float(wppm), float(ppm.std())
+
+def predict_minutes(log):
+    log = safe_sort_log(log)
+    log['MIN'] = parse_minutes_col(log['MIN'])
+    mins = log['MIN'].dropna()
+
+    if len(mins) == 0:
+        return 28
+
+    last5 = mins.head(5)
+    med = last5.median()
+    trend = last5.iloc[0] - last5.iloc[-1] if len(last5) >= 2 else 0
+
+    # simple trend adjustment
+    return float(np.clip(med + trend*0.25, 12, 40))
+
+def fatigue_factor(log):
+    log = safe_sort_log(log)
+    if len(log) < 3:
+        return 1.0
+
+    d0 = log.loc[0,'GAME_DATE']
+    d2 = log.loc[2,'GAME_DATE']
+    if (d0 - d2).days <= 3:
+        return 0.94
+
+    return 1.0
+
+def pace_factor(team, opp):
+    try:
+        t = TEAM_STATS[TEAM_STATS.TEAM_NAME == team].iloc[0]
+        o = TEAM_STATS[TEAM_STATS.TEAM_NAME == opp].iloc[0]
+        return np.sqrt(t.PACE * o.PACE) / LEAGUE_PACE
+    except:
+        return 1.0
+
+def defense_factor(opp):
+    try:
+        d = TEAM_STATS[TEAM_STATS.TEAM_NAME == opp].iloc[0].DEF_RATING
+        return d / LEAGUE_DEF
+    except:
+        return 1.0
+
+# -----------------------------
+# Monte Carlo Model
+# -----------------------------
+
+def simulate_points(mu_minutes, mu_ppm, ppm_sigma, line):
+    sims = 20000
+
+    min_sigma = max(2.5, mu_minutes*0.12)
+    sim_minutes = np.random.normal(mu_minutes, min_sigma, sims)
+    sim_minutes = np.clip(sim_minutes, 5, 48)
+
+    sim_ppm = np.random.normal(mu_ppm, max(0.05, ppm_sigma), sims)
+    sim_ppm = np.clip(sim_ppm, 0.2, 2.5)
+
+    pts = sim_minutes * sim_ppm
+
+    prob_over = (pts > line).mean() * 100
+    mean_proj = pts.mean()
+    p10 = np.percentile(pts,10)
+    p90 = np.percentile(pts,90)
+
+    return prob_over, mean_proj, p10, p90
+
+# -----------------------------
+# Data Fetch
+# -----------------------------
+
+@st.cache_data(ttl=1800)
+def get_player_log(player_name):
+    pl = players.find_players_by_full_name(player_name)
+    if not pl:
+        return None
+    pid = pl[0]['id']
+    df = playergamelog.PlayerGameLog(player_id=pid).get_data_frames()[0]
+    return df
+
+# -----------------------------
+# UI
+# -----------------------------
+
+st.title("NBA Points Predictor — Advanced Model")
+
+st.write("Unesi igrače za analizu (ime, tim, protivnik, linija).")
+
+rows = st.number_input("Broj igrača", 1, 20, 3)
+
+inputs = []
+for i in range(rows):
+    c1,c2,c3,c4 = st.columns(4)
+    name = c1.text_input(f"Igrač {i+1}")
+    team = c2.text_input("Tim")
+    opp = c3.text_input("Protivnik")
+    line = c4.number_input("Granica", value=20.5, key=i)
+    inputs.append((name,team,opp,line))
+
+if st.button("Analiziraj"):
+
+    results = []
+
+    for name,team,opp,line in inputs:
+        if not name:
+            continue
+
+        try:
+            log = get_player_log(name)
+            if log is None or len(log) == 0:
+                st.warning(f"Nema podataka za {name}")
+                continue
+
+            log = safe_sort_log(log)
+            log['MIN'] = parse_minutes_col(log['MIN'])
+
+            mu_minutes = predict_minutes(log)
+            mu_ppm, ppm_sigma = compute_ppm_features(log)
+
+            f_fat = fatigue_factor(log)
+            f_pace = pace_factor(team, opp)
+            f_def = defense_factor(opp)
+
+            adj_ppm = mu_ppm * f_pace * f_def * f_fat
+
+            prob, proj, p10, p90 = simulate_points(
+                mu_minutes,
+                adj_ppm,
+                ppm_sigma,
+                line
+            )
+
+            conf = np.clip(100 - ppm_sigma*60, 40, 95)
+
+            results.append({
+                "Igrač": name,
+                "Linija": line,
+                "Projekcija": round(proj,1),
+                "P_over_%": round(prob,1),
+                "P10": round(p10,1),
+                "P90": round(p90,1),
+                "Minutes_pred": round(mu_minutes,1),
+                "PPM_pred": round(adj_ppm,3),
+                "Confidence": round(conf,1)
+            })
+
+        except Exception as e:
+            st.error(f"Greška za {name}: {e}")
+            st.text(traceback.format_exc())
+
+    if results:
+        df = pd.DataFrame(results).sort_values("P_over_%", ascending=False)
+        st.dataframe(df, use_container_width=True)
+
+        st.subheader("Signal")
+        for _,r in df.iterrows():
+            if r.P_over_% >= 75:
+                tag = "🔥 STRONG OVER"
+            elif r.P_over_% >= 60:
+                tag = "✅ OVER lean"
+            elif r.P_over_% <= 40:
+                tag = "❌ UNDER lean"
+            else:
+                tag = "⚖️ No edge"
+
+            st.write(f"{r.Igrač}: {tag} ({r.P_over_%}%) — proj {r.Projekcija}")
