@@ -1,3 +1,11 @@
+from prop_engine import (
+    ensemble_prediction,
+    volatility_flag,
+    line_sensitivity,
+    bet_signal,
+    stake_size
+)
+
 import streamlit as st
 import pandas as pd
 
