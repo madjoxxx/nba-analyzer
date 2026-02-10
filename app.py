@@ -1,305 +1,187 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-
 from nba_api.stats.endpoints import playergamelog
-from nba_api.stats.static import players
 
-# -------------------------
-# OPTIONAL ML IMPORT
-# -------------------------
+# =========================
+# SAFE IMPORT ML
+# =========================
 
 ML_AVAILABLE = True
+
 try:
     from sklearn.ensemble import RandomForestRegressor
-    from sklearn.metrics import mean_absolute_error
+    from sklearn.model_selection import train_test_split
 except:
     ML_AVAILABLE = False
 
 
-# -------------------------
-# CONFIG
-# -------------------------
-
-MIN_GAMES_REQUIRED = 18
-
-
-# -------------------------
-# UTIL
-# -------------------------
-
-def parse_min(x):
-    try:
-        return float(x)
-    except:
-        if isinstance(x,str) and ":" in x:
-            m,s = x.split(":")
-            return float(m)+float(s)/60
-    return np.nan
-
+# =========================
+# DATA FETCH
+# =========================
 
 @st.cache_data(ttl=3600)
-def load_player_log(name):
-
-    pl = players.find_players_by_full_name(name)
-    if not pl:
-        return None
-
-    pid = pl[0]["id"]
-    df = playergamelog.PlayerGameLog(player_id=pid).get_data_frames()[0]
-
-    df["MIN"] = df["MIN"].apply(parse_min)
-    df = df.dropna(subset=["MIN"])
-    df = df.sort_values("GAME_DATE")
-
+def get_player_games(player_id, season="2024-25"):
+    df = playergamelog.PlayerGameLog(
+        player_id=player_id,
+        season=season
+    ).get_data_frames()[0]
     return df
 
 
-# -------------------------
-# MATCHUP ENGINE
-# -------------------------
-
-PACE = {"IND":1.05,"ATL":1.05,"WAS":1.05,"GSW":1.04,"LAL":1.03}
-DEF  = {"SAS":1.06,"CHA":1.05,"DET":1.05,"MIN":0.94,"BOS":0.94}
-
-def matchup_factor(team):
-    if not team:
-        return 1.0
-    team = team.upper()
-    return PACE.get(team,1.0) * DEF.get(team,1.0)
-
-
-# -------------------------
-# FATIGUE
-# -------------------------
-
-def fatigue_factor(df):
-    if len(df) < 2:
-        return 1.0
-
-    d0 = pd.to_datetime(df.iloc[-1]["GAME_DATE"])
-    d1 = pd.to_datetime(df.iloc[-2]["GAME_DATE"])
-
-    return 0.94 if (d0-d1).days <= 1 else 1.0
-
-
-# -------------------------
-# FORMULA MODEL
-# -------------------------
-
-def formula_projection(df, opp):
-
-    mins = df["MIN"].tail(8)
-    pts = df["PTS"].tail(8)
-
-    if len(mins) < 4:
-        return pts.mean()
-
-    mu_min = np.average(mins, weights=np.linspace(1.4,0.7,len(mins)))
-    ppm = np.average(pts/mins, weights=np.linspace(1.5,0.7,len(mins)))
-
-    proj = mu_min * ppm
-    proj *= matchup_factor(opp)
-    proj *= fatigue_factor(df)
-
-    return proj
-
-
-# -------------------------
-# FEATURE PIPELINE (ML)
-# -------------------------
+# =========================
+# FEATURE ENGINEERING
+# =========================
 
 def build_features(df):
 
-    df = df.copy()
+    df = df.sort_values("GAME_DATE")
 
-    df["USG"] = df["FGA"] + 0.44*df["FTA"] + df["TOV"]
-    df["PTS_L5"] = df["PTS"].rolling(5).mean()
-    df["MIN_L5"] = df["MIN"].rolling(5).mean()
-    df["FGA_L5"] = df["FGA"].rolling(5).mean()
+    df["PTS_roll5"] = df["PTS"].rolling(5).mean()
+    df["PTS_roll10"] = df["PTS"].rolling(10).mean()
+    df["MIN_roll5"] = df["MIN"].rolling(5).mean()
+    df["FG3M_roll5"] = df["FG3M"].rolling(5).mean()
+    df["FGA_roll5"] = df["FGA"].rolling(5).mean()
+
+    df["HOME"] = df["MATCHUP"].str.contains("vs").astype(int)
 
     df = df.dropna()
 
-    FEATURES = ["MIN","FGA","FG3A","FTA","USG","PTS_L5","MIN_L5","FGA_L5"]
+    features = [
+        "PTS_roll5",
+        "PTS_roll10",
+        "MIN_roll5",
+        "FG3M_roll5",
+        "FGA_roll5",
+        "HOME"
+    ]
 
-    return df, FEATURES
+    X = df[features]
+    y = df["PTS"]
+
+    return X, y
 
 
-# -------------------------
-# ML TRAIN + PREDICT
-# -------------------------
+# =========================
+# FALLBACK MODEL
+# =========================
 
-def ml_projection(df, FEATURES, opp):
+def fallback_prediction(df):
 
-    split = int(len(df)*0.8)
+    last5 = df["PTS"].tail(5)
 
-    train = df.iloc[:split]
-    valid = df.iloc[split:]
+    mean = last5.mean()
+    std = last5.std()
 
-    model = RandomForestRegressor(
-        n_estimators=350,
-        max_depth=7,
-        random_state=1
+    return mean, std
+
+
+# =========================
+# ML TRAIN
+# =========================
+
+def train_ml(X, y):
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, shuffle=False
     )
 
-    model.fit(train[FEATURES], train["PTS"])
+    model = RandomForestRegressor(
+        n_estimators=300,
+        max_depth=6,
+        random_state=42
+    )
 
-    pred = model.predict(valid[FEATURES])
-    mae = mean_absolute_error(valid["PTS"], pred)
+    model.fit(X_train, y_train)
 
-    row = df.iloc[-1].copy()
+    preds = model.predict(X_test)
+    mae = np.mean(np.abs(preds - y_test))
 
-    row["USG"] = row["FGA"] + 0.44*row["FTA"] + row["TOV"]
-    row["PTS_L5"] = df["PTS"].tail(5).mean()
-    row["MIN_L5"] = df["MIN"].tail(5).mean()
-    row["FGA_L5"] = df["FGA"].tail(5).mean()
-
-    factor = matchup_factor(opp)
-    row["FGA"] *= factor
-    row["FG3A"] *= factor
-    row["FTA"] *= factor
-
-    X = row[FEATURES].values.reshape(1,-1)
-
-    pred_next = model.predict(X)[0]
-    pred_next *= fatigue_factor(df)
-
-    return pred_next, mae
+    return model, mae
 
 
-# -------------------------
-# VARIANCE SCORE
-# -------------------------
-
-def variance_score(df):
-
-    last = df["PTS"].tail(12)
-
-    if last.mean() == 0:
-        return "HIGH"
-
-    cv = last.std() / last.mean()
-
-    if cv < 0.25:
-        return "LOW"
-    if cv < 0.40:
-        return "MEDIUM"
-    return "HIGH"
-
-
-# -------------------------
+# =========================
 # MONTE CARLO
-# -------------------------
+# =========================
 
-def simulate(mu, line, err):
+def monte_carlo(mean, std, line, sims=10000):
 
-    sims = 10000
-    sd = max(err, mu*0.2)
+    samples = np.random.normal(mean, std, sims)
 
-    pts = np.random.normal(mu, sd, sims)
-    pts = np.clip(pts,0,90)
+    over = np.mean(samples > line)
+    under = 1 - over
 
-    prob = (pts > line).mean()
-
-    return prob, np.percentile(pts,10), np.percentile(pts,90)
+    return over, under
 
 
-# -------------------------
-# SHARP METRICS
-# -------------------------
+# =========================
+# STREAMLIT UI
+# =========================
 
-def expected_value(prob, odds):
-    return prob*(odds-1) - (1-prob)
+st.title("NBA Points ML Predictor")
 
+player_id = st.number_input("Player ID", value=203999)
+line = st.number_input("Points Line", value=24.5)
 
-def bet_grade(prob, edge, variance):
+if st.button("Run Prediction"):
 
-    score = 0
+    df = get_player_games(player_id)
 
-    if prob > 0.70: score += 2
-    elif prob > 0.60: score += 1
-
-    if abs(edge) > 3: score += 2
-    elif abs(edge) > 1.5: score += 1
-
-    if variance == "LOW": score += 2
-    elif variance == "MEDIUM": score += 1
-
-    if score >= 5: return "A"
-    if score >= 3: return "B"
-    if score >= 2: return "C"
-    return "D"
-
-
-# -------------------------
-# UI
-# -------------------------
-
-st.title("NBA Hybrid Sharp ML Model")
-
-name = st.text_input("Player name")
-opp = st.text_input("Opponent (e.g. BOS)")
-line = st.number_input("Points line", value=20.5)
-odds = st.number_input("Odds (decimal)", value=1.85)
-
-if st.button("Run Model"):
-
-    df = load_player_log(name)
-
-    if df is None or len(df) < MIN_GAMES_REQUIRED:
-        st.write("Not enough data")
+    if len(df) < 15:
+        st.error("Not enough games")
         st.stop()
 
-    formula_pred = formula_projection(df, opp)
+    # ---------- fallback baseline ----------
+    base_mean, base_std = fallback_prediction(df)
 
+    # ---------- ML ----------
     if ML_AVAILABLE:
 
-        df_ml, FEATURES = build_features(df)
-        ml_pred, mae = ml_projection(df_ml, FEATURES, opp)
+        X, y = build_features(df)
 
-        final_pred = 0.6*ml_pred + 0.4*formula_pred
-        err = mae
-        model_type = "ML + Formula"
+        model, mae = train_ml(X, y)
+
+        latest = X.iloc[-1:]
+        ml_pred = model.predict(latest)[0]
 
     else:
+        ml_pred = base_mean
+        mae = base_std
 
-        final_pred = formula_pred
-        err = df["PTS"].tail(10).std()
-        model_type = "Formula fallback"
+    # ---------- HYBRID ----------
+    hybrid = ml_pred * 0.7 + base_mean * 0.3
 
+    # ---------- monte carlo ----------
+    over, under = monte_carlo(hybrid, base_std, line)
 
-    prob, p10, p90 = simulate(final_pred, line, err)
+    # ---------- confidence ----------
+    confidence = max(0, 100 - mae * 3)
 
-    edge = final_pred - line
-    var_class = variance_score(df)
-    ev = expected_value(prob, odds)
-    grade = bet_grade(prob, edge, var_class)
+    # =========================
+    # OUTPUT
+    # =========================
 
-    st.subheader("MODEL OUTPUT")
+    st.subheader("Prediction")
 
-    st.write("Model:", model_type)
-    st.write("Projection:", round(final_pred,1))
-    st.write("Line:", line)
-    st.write("Edge:", round(edge,2))
-    st.write("Over %:", round(prob*100,1))
-    st.write("Range:", round(p10,1), "-", round(p90,1))
-    st.write("Variance:", var_class)
+    st.write(f"Baseline Avg (L5): {base_mean:.2f}")
+    st.write(f"ML Prediction: {ml_pred:.2f}")
+    st.write(f"Hybrid Prediction: {hybrid:.2f}")
 
-    st.subheader("BET METRICS")
+    st.subheader("Probabilities")
 
-    st.write("Expected Value:", round(ev,3))
-    st.write("Bet Grade:", grade)
+    st.write(f"Over {line}: {over*100:.1f}%")
+    st.write(f"Under {line}: {under*100:.1f}%")
 
-    if ev > 0:
-        st.success("+EV BET")
+    st.subheader("Model Confidence")
+
+    st.write(f"{confidence:.1f}%")
+
+    if confidence > 70:
+        st.success("High confidence")
+    elif confidence > 55:
+        st.warning("Medium confidence")
     else:
-        st.warning("Negative EV")
+        st.error("Low confidence")
 
-    if prob > 0.75:
-        st.success("STRONG OVER")
-    elif prob > 0.60:
-        st.info("LEAN OVER")
-    elif prob < 0.40:
-        st.warning("LEAN UNDER")
-    else:
-        st.write("NO EDGE")
+    if not ML_AVAILABLE:
+        st.warning("Running without sklearn — fallback mode active")
