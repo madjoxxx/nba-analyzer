@@ -4,25 +4,30 @@ from nba_api.stats.endpoints import playergamelog
 
 
 # -------------------------
-# DATA
+# DATA LOAD
 # -------------------------
 
 def get_games(pid, season="2024-25"):
 
-    df = playergamelog.PlayerGameLog(
-        player_id=pid,
-        season=season
-    ).get_data_frames()[0]
+    try:
+        df = playergamelog.PlayerGameLog(
+            player_id=pid,
+            season=season
+        ).get_data_frames()[0]
+    except:
+        return None
+
+    if df is None or len(df) == 0:
+        return None
 
     df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
-
     df = df.sort_values("GAME_DATE").reset_index(drop=True)
 
     return df
 
 
 # -------------------------
-# FEATURE ENGINEERING
+# FEATURES
 # -------------------------
 
 def build_features(df):
@@ -34,35 +39,38 @@ def build_features(df):
 
     df["MIN_L5"] = df["MIN"].rolling(5).mean()
 
-    # usage proxy = shot attempts + FT attempts
-    df["USG_PROXY"] = df["FGA"] + 0.44 * df["FTA"]
-    df["USG_L5"] = df["USG_PROXY"].rolling(5).mean()
+    df["USG"] = df["FGA"] + 0.44 * df["FTA"]
+    df["USG_L5"] = df["USG"].rolling(5).mean()
 
-    # pace proxy = possessions proxy
-    df["PACE_PROXY"] = df["FGA"] + df["TOV"] + 0.44 * df["FTA"]
-    df["PACE_L5"] = df["PACE_PROXY"].rolling(5).mean()
+    df["PACE"] = df["FGA"] + df["TOV"] + 0.44 * df["FTA"]
+    df["PACE_L5"] = df["PACE"].rolling(5).mean()
 
     df["HOME"] = df["MATCHUP"].str.contains("vs").astype(int)
 
     df["REST"] = df["GAME_DATE"].diff().dt.days.fillna(2)
 
-    df["FORM_W"] = df["PTS"].ewm(span=7).mean()
+    df["FORM"] = df["PTS"].ewm(span=7).mean()
 
-    return df.dropna().reset_index(drop=True)
+    df = df.dropna().reset_index(drop=True)
+
+    if len(df) < 20:
+        return None
+
+    return df
 
 
 # -------------------------
-# SIMPLE LINEAR ML
+# LINEAR ML
 # -------------------------
 
-def train_linear(X, y):
+def train_model(X, y):
 
     X = np.c_[np.ones(len(X)), X]
     w = np.linalg.pinv(X.T @ X) @ X.T @ y
     return w
 
 
-def predict_linear(w, x):
+def predict_model(w, x):
 
     x = np.r_[1, x]
     return float(x @ w)
@@ -72,11 +80,11 @@ def predict_linear(w, x):
 # PROJECTION
 # -------------------------
 
-def project_points(df):
+def project(df):
 
     feats = build_features(df)
 
-    if len(feats) < 25:
+    if feats is None:
         return None, None
 
     cols = [
@@ -92,9 +100,9 @@ def project_points(df):
     X = feats[cols].values
     y = feats["PTS"].values
 
-    w = train_linear(X, y)
+    w = train_model(X, y)
 
-    pred = predict_linear(w, X[-1])
+    pred = predict_model(w, X[-1])
 
     return pred, feats
 
@@ -119,67 +127,56 @@ def prob_over(pred, line, feats):
 # BACKTEST SAFE
 # -------------------------
 
-def backtest_hit_rate(df, line):
+def backtest(df, line):
 
     pts = df["PTS"].to_numpy()
 
     if len(pts) < 15:
-        return 0
+        return 0.5
 
     hits = 0
     tests = 0
 
     for i in range(12, len(pts)):
-
         proj = pts[:i][-5:].mean()
-        actual = pts[i]
-
-        if actual > line:
+        if pts[i] > line:
             hits += 1
-
         tests += 1
 
     if tests == 0:
-        return 0
+        return 0.5
 
     return hits / tests
 
 
 # -------------------------
-# LABELS
+# METRICS
 # -------------------------
 
 def volatility(df):
 
     s = df["PTS"].std()
 
-    if s < 4:
-        return "LOW"
-    if s < 8:
-        return "MED"
+    if s < 4: return "LOW"
+    if s < 8: return "MED"
     return "HIGH"
 
 
 def consistency(df):
 
-    return round(
-        (1 - df["PTS"].std() / df["PTS"].mean()) * 100,
-        1
-    )
+    m = df["PTS"].mean()
+    s = df["PTS"].std()
 
+    if m == 0:
+        return 0
 
-# -------------------------
-# CONFIDENCE
-# -------------------------
+    return round((1 - s/m) * 100, 1)
+
 
 def confidence(over, hit):
 
     return round((over*0.6 + hit*0.4) * 100, 1)
 
-
-# -------------------------
-# STAKE
-# -------------------------
 
 def stake(edge, conf):
 
