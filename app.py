@@ -1,316 +1,271 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from nba_api.stats.endpoints import playergamelog, leaguedashteamstats
-from nba_api.stats.static import players
-import traceback
 
-st.set_page_config(page_title="NBA Points Predictor Pro", layout="wide")
+from nba_api.stats.endpoints import (
+    playergamelog,
+    commonallplayers
+)
 
-# -----------------------------
-# TEAM STATS (robust columns)
-# -----------------------------
+# =========================
+# SAFE ML IMPORT
+# =========================
+
+ML_AVAILABLE = True
+try:
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.model_selection import train_test_split
+except:
+    ML_AVAILABLE = False
+
+
+# =========================
+# CACHE DATA
+# =========================
+
+@st.cache_data(ttl=86400)
+def load_players():
+    return commonallplayers.CommonAllPlayers(
+        is_only_current_season=1
+    ).get_data_frames()[0]
+
 
 @st.cache_data(ttl=3600)
-def get_team_stats():
-
-    df = leaguedashteamstats.LeagueDashTeamStats().get_data_frames()[0]
-    cols = df.columns.tolist()
-
-    def find_col(possible):
-        for c in cols:
-            if c.upper() in possible:
-                return c
-        return None
-
-    pace_col = find_col(["PACE"])
-    def_col  = find_col(["DEF_RATING","DEFRTG"])
-    off_col  = find_col(["OFF_RATING","OFFRTG"])
-
-    if pace_col is None:
-        df["PACE_FIX"] = 100
-        pace_col = "PACE_FIX"
-
-    if def_col is None:
-        df["DEF_FIX"] = 112
-        def_col = "DEF_FIX"
-
-    if off_col is None:
-        df["OFF_FIX"] = 112
-        off_col = "OFF_FIX"
-
-    out = df[[
-        "TEAM_ID",
-        "TEAM_NAME",
-        pace_col,
-        def_col,
-        off_col
-    ]].rename(columns={
-        pace_col:"PACE",
-        def_col:"DEF_RATING",
-        off_col:"OFF_RATING"
-    })
-
-    return out
+def get_games(player_id):
+    return playergamelog.PlayerGameLog(
+        player_id=player_id,
+        season="2024-25"
+    ).get_data_frames()[0]
 
 
-TEAM_STATS = get_team_stats()
-LEAGUE_PACE = TEAM_STATS["PACE"].mean()
-LEAGUE_DEF = TEAM_STATS["DEF_RATING"].mean()
-
-# -----------------------------
-# MINUTES PARSER
-# -----------------------------
-
-def parse_minutes_col(min_series):
-
-    def parse_val(x):
-        if pd.isna(x):
-            return np.nan
-
-        try:
-            return float(x)
-        except:
-            pass
-
-        if isinstance(x,str) and ":" in x:
-            try:
-                mm,ss = x.split(":")
-                return float(mm) + float(ss)/60
-            except:
-                return np.nan
-
-        return np.nan
-
-    return min_series.apply(parse_val)
-
-
-def safe_sort_log(log):
-    log = log.copy()
-    log["GAME_DATE"] = pd.to_datetime(log["GAME_DATE"])
-    return log.sort_values("GAME_DATE", ascending=False).reset_index(drop=True)
-
-# -----------------------------
+# =========================
 # FEATURES
-# -----------------------------
+# =========================
 
-def recency_weights(n):
-    return np.exp(-np.arange(n)/4)
+def build_features(df):
 
+    df = df.sort_values("GAME_DATE")
 
-def compute_ppm_features(log):
+    df["PTS_r5"] = df["PTS"].rolling(5).mean()
+    df["PTS_r10"] = df["PTS"].rolling(10).mean()
+    df["MIN_r5"] = df["MIN"].rolling(5).mean()
+    df["USAGE"] = df["FGA"] + df["FTA"] * 0.44
+    df["HOME"] = df["MATCHUP"].str.contains("vs").astype(int)
 
-    log = safe_sort_log(log)
-    log["MIN"] = parse_minutes_col(log["MIN"])
-    log = log.dropna(subset=["MIN"])
-    log = log[log["MIN"] > 3]
+    df = df.dropna()
 
-    if len(log) == 0:
-        return 0.8, 0.25
+    feats = ["PTS_r5", "PTS_r10", "MIN_r5", "USAGE", "HOME"]
 
-    ppm = log["PTS"] / log["MIN"]
-    w = recency_weights(len(ppm))
-
-    wppm = np.average(ppm, weights=w)
-    return float(wppm), float(ppm.std())
+    return df[feats], df["PTS"]
 
 
-def predict_minutes(log):
+# =========================
+# BASELINE
+# =========================
 
-    log = safe_sort_log(log)
-    log["MIN"] = parse_minutes_col(log["MIN"])
-    mins = log["MIN"].dropna()
-
-    if len(mins) == 0:
-        return 28
-
-    last5 = mins.head(5)
-    med = last5.median()
-
-    if len(last5) >= 2:
-        trend = last5.iloc[0] - last5.iloc[-1]
-    else:
-        trend = 0
-
-    pred = med + trend * 0.25
-    return float(np.clip(pred, 12, 40))
+def baseline(df):
+    last5 = df["PTS"].tail(5)
+    return last5.mean(), last5.std()
 
 
-def fatigue_factor(log):
+# =========================
+# ML TRAIN
+# =========================
 
-    log = safe_sort_log(log)
+def train_ml(X, y):
 
-    if len(log) < 3:
-        return 1.0
+    Xtr, Xte, ytr, yte = train_test_split(
+        X, y, test_size=0.2, shuffle=False
+    )
 
-    d0 = log.loc[0,"GAME_DATE"]
-    d2 = log.loc[2,"GAME_DATE"]
+    model = RandomForestRegressor(
+        n_estimators=350,
+        max_depth=7,
+        random_state=42
+    )
 
-    if (d0 - d2).days <= 3:
-        return 0.94
+    model.fit(Xtr, ytr)
 
-    return 1.0
+    pred = model.predict(Xte)
+    mae = np.mean(np.abs(pred - yte))
 
-
-def pace_factor(team, opp):
-
-    try:
-        t = TEAM_STATS[TEAM_STATS.TEAM_NAME == team].iloc[0]
-        o = TEAM_STATS[TEAM_STATS.TEAM_NAME == opp].iloc[0]
-        return np.sqrt(t.PACE * o.PACE) / LEAGUE_PACE
-    except:
-        return 1.0
+    return model, mae
 
 
-def defense_factor(opp):
-
-    try:
-        d = TEAM_STATS[TEAM_STATS.TEAM_NAME == opp].iloc[0].DEF_RATING
-        return d / LEAGUE_DEF
-    except:
-        return 1.0
-
-# -----------------------------
+# =========================
 # MONTE CARLO
-# -----------------------------
+# =========================
 
-def simulate_points(mu_minutes, mu_ppm, ppm_sigma, line):
+def monte(mean, std, line):
 
-    sims = 20000
+    sims = np.random.normal(mean, std, 12000)
+    over = np.mean(sims > line)
 
-    min_sigma = max(2.5, mu_minutes * 0.12)
+    return over
 
-    sim_minutes = np.random.normal(mu_minutes, min_sigma, sims)
-    sim_minutes = np.clip(sim_minutes, 5, 48)
 
-    sim_ppm = np.random.normal(mu_ppm, max(0.05, ppm_sigma), sims)
-    sim_ppm = np.clip(sim_ppm, 0.2, 2.5)
+# =========================
+# PLAYER MODEL PIPELINE
+# =========================
 
-    pts = sim_minutes * sim_ppm
+def run_model(player_id, line):
 
-    prob_over = (pts > line).mean() * 100
-    mean_proj = pts.mean()
-    p10 = np.percentile(pts,10)
-    p90 = np.percentile(pts,90)
-
-    return prob_over, mean_proj, p10, p90
-
-# -----------------------------
-# PLAYER DATA
-# -----------------------------
-
-@st.cache_data(ttl=1800)
-def get_player_log(player_name):
-
-    pl = players.find_players_by_full_name(player_name)
-
-    if not pl:
+    try:
+        df = get_games(player_id)
+    except:
         return None
 
-    pid = pl[0]["id"]
-    df = playergamelog.PlayerGameLog(player_id=pid).get_data_frames()[0]
-    return df
+    if len(df) < 15:
+        return None
 
-# -----------------------------
+    base_mean, base_std = baseline(df)
+
+    if ML_AVAILABLE:
+
+        X, y = build_features(df)
+        model, mae = train_ml(X, y)
+        ml_pred = model.predict(X.iloc[-1:])[0]
+
+    else:
+        ml_pred = base_mean
+        mae = base_std
+
+    pred = ml_pred * 0.65 + base_mean * 0.35
+
+    over_prob = monte(pred, base_std, line)
+
+    edge = pred - line
+    conf = max(0, 100 - mae * 3)
+
+    return {
+        "pred": pred,
+        "over": over_prob,
+        "edge": edge,
+        "conf": conf
+    }
+
+
+# =========================
 # UI
-# -----------------------------
+# =========================
 
-st.title("NBA Points Predictor — Advanced Model")
+st.title("NBA ML Prop Finder")
 
-rows = st.number_input("Broj igrača", 1, 20, 3)
+players_df = load_players()
 
-inputs = []
+mode = st.radio(
+    "Mode",
+    ["Single Player", "Top Picks Scanner"]
+)
 
-for i in range(rows):
-    c1,c2,c3,c4 = st.columns(4)
+line = st.number_input("Points Line", value=20.5)
 
-    name = c1.text_input(f"Igrač {i+1}")
-    team = c2.text_input("Tim", key=f"team{i}")
-    opp  = c3.text_input("Protivnik", key=f"opp{i}")
-    line = c4.number_input("Granica", value=20.5, key=f"line{i}")
 
-    inputs.append((name,team,opp,line))
+# =========================
+# SINGLE PLAYER MODE
+# =========================
 
-# -----------------------------
-# RUN
-# -----------------------------
+if mode == "Single Player":
 
-if st.button("Analiziraj"):
+    name = st.text_input("Player name")
 
-    results = []
+    filtered = players_df[
+        players_df["DISPLAY_FIRST_LAST"]
+        .str.contains(name, case=False, na=False)
+    ]
 
-    for name,team,opp,line in inputs:
+    if len(filtered) > 0:
 
-        if not name:
-            continue
+        choice = st.selectbox(
+            "Select player",
+            filtered["DISPLAY_FIRST_LAST"].values
+        )
 
-        try:
+        pid = int(
+            filtered[
+                filtered["DISPLAY_FIRST_LAST"] == choice
+            ]["PERSON_ID"].values[0]
+        )
 
-            log = get_player_log(name)
+        if st.button("Run Prediction"):
 
-            if log is None or len(log) == 0:
-                st.warning(f"Nema podataka za {name}")
-                continue
+            r = run_model(pid, line)
 
-            log = safe_sort_log(log)
-            log["MIN"] = parse_minutes_col(log["MIN"])
-
-            mu_minutes = predict_minutes(log)
-            mu_ppm, ppm_sigma = compute_ppm_features(log)
-
-            f_fat = fatigue_factor(log)
-            f_pace = pace_factor(team, opp)
-            f_def  = defense_factor(opp)
-
-            adj_ppm = mu_ppm * f_pace * f_def * f_fat
-
-            prob, proj, p10, p90 = simulate_points(
-                mu_minutes,
-                adj_ppm,
-                ppm_sigma,
-                line
-            )
-
-            conf = np.clip(100 - ppm_sigma*60, 40, 95)
-
-            results.append({
-                "Igrač": name,
-                "Linija": line,
-                "Projekcija": round(proj,1),
-                "P_over_pct": round(prob,1),
-                "P10": round(p10,1),
-                "P90": round(p90,1),
-                "Minutes_pred": round(mu_minutes,1),
-                "PPM_pred": round(adj_ppm,3),
-                "Confidence": round(conf,1)
-            })
-
-        except Exception as e:
-            st.error(f"Greška za {name}: {e}")
-            st.text(traceback.format_exc())
-
-    if results:
-
-        df = pd.DataFrame(results).sort_values("P_over_pct", ascending=False)
-
-        st.dataframe(df, use_container_width=True)
-
-        st.subheader("Signal")
-
-        for _, r in df.iterrows():
-
-            p_over = r["P_over_pct"]
-
-            if p_over >= 75:
-                tag = "🔥 STRONG OVER"
-            elif p_over >= 60:
-                tag = "✅ OVER lean"
-            elif p_over <= 40:
-                tag = "❌ UNDER lean"
+            if r is None:
+                st.error("Not enough data")
             else:
-                tag = "⚖️ No edge"
+                st.subheader("Prediction")
 
-            st.write(
-                f"{r['Igrač']}: {tag} ({p_over}%) — proj {r['Projekcija']} "
-                f"[{r['P10']}–{r['P90']}]"
+                st.write(f"Projected: {r['pred']:.2f}")
+                st.write(f"Over {line}: {r['over']*100:.1f}%")
+                st.write(f"Edge: {r['edge']:.2f}")
+                st.write(f"Confidence: {r['conf']:.1f}%")
+
+                if r["edge"] > 2:
+                    st.success("Strong Value")
+                elif r["edge"] > 0.7:
+                    st.warning("Small Value")
+                else:
+                    st.error("No Edge")
+
+
+# =========================
+# TOP PICKS SCANNER
+# =========================
+
+else:
+
+    sample_size = st.slider(
+        "Number of players to scan",
+        10, 120, 40
+    )
+
+    if st.button("Scan Players"):
+
+        results = []
+
+        sample = players_df.head(sample_size)
+
+        progress = st.progress(0)
+
+        for i, row in enumerate(sample.itertuples()):
+
+            pid = row.PERSON_ID
+            name = row.DISPLAY_FIRST_LAST
+
+            r = run_model(pid, line)
+
+            if r and r["conf"] > 55:
+
+                results.append({
+                    "Player": name,
+                    "Proj": round(r["pred"], 1),
+                    "Over%": round(r["over"]*100, 1),
+                    "Edge": round(r["edge"], 2),
+                    "Conf": round(r["conf"], 1)
+                })
+
+            progress.progress((i+1)/sample_size)
+
+        if len(results) == 0:
+            st.error("No valid picks")
+        else:
+
+            df = pd.DataFrame(results)
+
+            df = df.sort_values(
+                ["Edge", "Over%"],
+                ascending=False
             )
+
+            st.subheader("Top Picks")
+
+            st.dataframe(df.head(15))
+
+
+# =========================
+# FOOTER
+# =========================
+
+if not ML_AVAILABLE:
+    st.warning("Running fallback model — sklearn not installed")
