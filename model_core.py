@@ -1,160 +1,182 @@
 import numpy as np
 import pandas as pd
-
-ML_AVAILABLE = True
-try:
-    from sklearn.ensemble import RandomForestRegressor
-    from sklearn.model_selection import train_test_split
-except:
-    ML_AVAILABLE = False
+from sklearn.ensemble import RandomForestRegressor
 
 
-# =====================
-# FEATURES
-# =====================
+# -------------------------
+# FEATURE BUILDING
+# -------------------------
 
 def build_features(df):
 
-    df = df.sort_values("GAME_DATE")
+    df = df.copy()
 
-    df["PTS_r5"] = df["PTS"].rolling(5).mean()
-    df["PTS_r10"] = df["PTS"].rolling(10).mean()
+    df["pts_l5"] = df["PTS"].rolling(5).mean()
+    df["pts_l10"] = df["PTS"].rolling(10).mean()
+    df["min_l5"] = df["MIN"].rolling(5).mean()
 
-    df["MIN_r5"] = df["MIN"].rolling(5).mean()
-    df["MIN_r10"] = df["MIN"].rolling(10).mean()
+    df["pts_std10"] = df["PTS"].rolling(10).std()
+    df["trend"] = df["pts_l5"] - df["pts_l10"]
 
-    df["USAGE"] = df["FGA"] + df["FTA"] * 0.44
-
-    df["HOME"] = df["MATCHUP"].str.contains("vs").astype(int)
+    df["rest"] = df["GAME_DATE"].diff().dt.days.fillna(2)
 
     df = df.dropna()
 
-    feats = [
-        "PTS_r5","PTS_r10",
-        "MIN_r5","MIN_r10",
-        "USAGE","HOME"
-    ]
-
-    return df[feats], df["PTS"]
+    return df
 
 
-# =====================
-# BASELINE
-# =====================
+# -------------------------
+# TRAIN ML
+# -------------------------
 
-def baseline(df):
-    last5 = df["PTS"].tail(5)
-    return last5.mean(), last5.std()
+def train_model(df):
 
+    feats = ["pts_l5", "pts_l10", "min_l5", "pts_std10", "trend", "rest"]
 
-# =====================
-# MINUTES MODEL
-# =====================
+    if len(df) < 25:
+        return None, None
 
-def predict_minutes(df):
-
-    last5 = df["MIN"].tail(5)
-    trend = last5.mean()
-
-    if last5.iloc[-1] > trend:
-        trend *= 1.03
-
-    return trend
-
-
-# =====================
-# CONSISTENCY
-# =====================
-
-def consistency_score(df):
-
-    std = df["PTS"].tail(10).std()
-
-    if std < 4:
-        return 90
-    if std < 6:
-        return 75
-    if std < 9:
-        return 60
-    return 45
-
-
-# =====================
-# ML TRAIN
-# =====================
-
-def train_ml(X, y):
-
-    if not ML_AVAILABLE:
-        return None, y.std()
-
-    Xtr, Xte, ytr, yte = train_test_split(
-        X, y, test_size=0.2, shuffle=False
-    )
+    X = df[feats]
+    y = df["PTS"]
 
     model = RandomForestRegressor(
-        n_estimators=400,
-        max_depth=8,
+        n_estimators=300,
+        max_depth=6,
         random_state=42
     )
 
-    model.fit(Xtr, ytr)
+    model.fit(X, y)
 
-    pred = model.predict(Xte)
-    mae = np.mean(np.abs(pred - yte))
-
-    return model, mae
+    return model, feats
 
 
-# =====================
-# MONTE CARLO
-# =====================
+# -------------------------
+# PREDICT NEXT GAME
+# -------------------------
 
-def monte(mean, std, line):
+def predict_next(df, model, feats):
 
-    sims = np.random.normal(mean, std, 15000)
-    return np.mean(sims > line)
+    last = df.iloc[-1]
+
+    X = pd.DataFrame([last[feats]])
+
+    pred = model.predict(X)[0]
+
+    return pred
 
 
-# =====================
-# BACKTEST
-# =====================
+# -------------------------
+# PROBABILITY ESTIMATE
+# -------------------------
+
+def prob_over(pred, line, std):
+
+    if std < 1:
+        std = 1
+
+    z = (pred - line) / std
+
+    p = 1 / (1 + np.exp(-z))
+
+    return float(p)
+
+
+# -------------------------
+# BACKTEST HIT RATE SAFE
+# -------------------------
 
 def backtest_hit_rate(df, line):
 
-    # zaštita — ako nešto fali u kolonama
-    if "PTS" not in df.columns:
-        return 0
+    if len(df) < 20:
+        return 0.5
 
-    # sortiraj + reset indeksa → ključni dio
-    df = df.sort_values("GAME_DATE").reset_index(drop=True)
-
-    pts = df["PTS"].to_numpy()
-    n = len(pts)
-
-    if n < 15:
-        return 0
-
-    hits = 0
     tests = 0
+    hits = 0
 
-    # walk-forward stabilna petlja
-    for i in range(12, n):
+    for i in range(15, len(df)):
 
-        hist = pts[:i]
+        window = df.iloc[:i]
 
-        if len(hist) < 5:
+        if len(window) < 15:
             continue
 
-        proj = hist[-5:].mean()
-        actual = pts[i]
+        avg = window["PTS"].tail(10).mean()
 
-        if actual > line:
-            hits += 1
+        if avg > line:
+            tests += 1
 
-        tests += 1
+            if df.iloc[i]["PTS"] > line:
+                hits += 1
 
     if tests == 0:
-        return 0
+        return 0.5
 
     return hits / tests
+
+
+# -------------------------
+# CONFIDENCE ENGINE
+# -------------------------
+
+def confidence_score(edge, prob, hitrate, vol):
+
+    score = (
+        edge * 3
+        + (prob - 0.5) * 10
+        + (hitrate - 0.5) * 6
+        - vol * 0.15
+    )
+
+    return float(max(0, min(100, score * 10)))
+
+
+# -------------------------
+# TAGGING
+# -------------------------
+
+def signal_tag(prob, edge):
+
+    if prob > 0.72 and edge > 2:
+        return "ELITE"
+
+    if prob > 0.65:
+        return "STRONG"
+
+    if prob > 0.57:
+        return "LEAN"
+
+    return "PASS"
+
+
+def stake_size(conf):
+
+    if conf > 80:
+        return 3
+
+    if conf > 65:
+        return 2
+
+    if conf > 55:
+        return 1
+
+    return 0.5
+
+
+# -------------------------
+# LINE CURVE
+# -------------------------
+
+def line_curve(pred, std):
+
+    out = []
+
+    for l in np.arange(pred - 5, pred + 6, 1):
+
+        p = prob_over(pred, l, std)
+
+        out.append({
+            "Line": round(l, 1),
+            "OverProb": round(p, 3)
+        })
+
+    return out
