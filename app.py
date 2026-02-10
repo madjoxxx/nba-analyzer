@@ -1,316 +1,247 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from nba_api.stats.endpoints import playergamelog, leaguedashteamstats
+
+from nba_api.stats.endpoints import playergamelog
 from nba_api.stats.static import players
-import traceback
 
-st.set_page_config(page_title="NBA Points Predictor Pro", layout="wide")
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error
 
-# -----------------------------
-# TEAM STATS (robust columns)
-# -----------------------------
+
+# -------------------------
+# CONFIG
+# -------------------------
+
+MIN_GAMES_REQUIRED = 18
+N_ESTIMATORS = 400
+
+
+# -------------------------
+# UTIL
+# -------------------------
+
+def parse_min(x):
+    try:
+        return float(x)
+    except:
+        if isinstance(x,str) and ":" in x:
+            m,s = x.split(":")
+            return float(m)+float(s)/60
+    return np.nan
+
 
 @st.cache_data(ttl=3600)
-def get_team_stats():
+def load_player_log(name):
 
-    df = leaguedashteamstats.LeagueDashTeamStats().get_data_frames()[0]
-    cols = df.columns.tolist()
-
-    def find_col(possible):
-        for c in cols:
-            if c.upper() in possible:
-                return c
-        return None
-
-    pace_col = find_col(["PACE"])
-    def_col  = find_col(["DEF_RATING","DEFRTG"])
-    off_col  = find_col(["OFF_RATING","OFFRTG"])
-
-    if pace_col is None:
-        df["PACE_FIX"] = 100
-        pace_col = "PACE_FIX"
-
-    if def_col is None:
-        df["DEF_FIX"] = 112
-        def_col = "DEF_FIX"
-
-    if off_col is None:
-        df["OFF_FIX"] = 112
-        off_col = "OFF_FIX"
-
-    out = df[[
-        "TEAM_ID",
-        "TEAM_NAME",
-        pace_col,
-        def_col,
-        off_col
-    ]].rename(columns={
-        pace_col:"PACE",
-        def_col:"DEF_RATING",
-        off_col:"OFF_RATING"
-    })
-
-    return out
-
-
-TEAM_STATS = get_team_stats()
-LEAGUE_PACE = TEAM_STATS["PACE"].mean()
-LEAGUE_DEF = TEAM_STATS["DEF_RATING"].mean()
-
-# -----------------------------
-# MINUTES PARSER
-# -----------------------------
-
-def parse_minutes_col(min_series):
-
-    def parse_val(x):
-        if pd.isna(x):
-            return np.nan
-
-        try:
-            return float(x)
-        except:
-            pass
-
-        if isinstance(x,str) and ":" in x:
-            try:
-                mm,ss = x.split(":")
-                return float(mm) + float(ss)/60
-            except:
-                return np.nan
-
-        return np.nan
-
-    return min_series.apply(parse_val)
-
-
-def safe_sort_log(log):
-    log = log.copy()
-    log["GAME_DATE"] = pd.to_datetime(log["GAME_DATE"])
-    return log.sort_values("GAME_DATE", ascending=False).reset_index(drop=True)
-
-# -----------------------------
-# FEATURES
-# -----------------------------
-
-def recency_weights(n):
-    return np.exp(-np.arange(n)/4)
-
-
-def compute_ppm_features(log):
-
-    log = safe_sort_log(log)
-    log["MIN"] = parse_minutes_col(log["MIN"])
-    log = log.dropna(subset=["MIN"])
-    log = log[log["MIN"] > 3]
-
-    if len(log) == 0:
-        return 0.8, 0.25
-
-    ppm = log["PTS"] / log["MIN"]
-    w = recency_weights(len(ppm))
-
-    wppm = np.average(ppm, weights=w)
-    return float(wppm), float(ppm.std())
-
-
-def predict_minutes(log):
-
-    log = safe_sort_log(log)
-    log["MIN"] = parse_minutes_col(log["MIN"])
-    mins = log["MIN"].dropna()
-
-    if len(mins) == 0:
-        return 28
-
-    last5 = mins.head(5)
-    med = last5.median()
-
-    if len(last5) >= 2:
-        trend = last5.iloc[0] - last5.iloc[-1]
-    else:
-        trend = 0
-
-    pred = med + trend * 0.25
-    return float(np.clip(pred, 12, 40))
-
-
-def fatigue_factor(log):
-
-    log = safe_sort_log(log)
-
-    if len(log) < 3:
-        return 1.0
-
-    d0 = log.loc[0,"GAME_DATE"]
-    d2 = log.loc[2,"GAME_DATE"]
-
-    if (d0 - d2).days <= 3:
-        return 0.94
-
-    return 1.0
-
-
-def pace_factor(team, opp):
-
-    try:
-        t = TEAM_STATS[TEAM_STATS.TEAM_NAME == team].iloc[0]
-        o = TEAM_STATS[TEAM_STATS.TEAM_NAME == opp].iloc[0]
-        return np.sqrt(t.PACE * o.PACE) / LEAGUE_PACE
-    except:
-        return 1.0
-
-
-def defense_factor(opp):
-
-    try:
-        d = TEAM_STATS[TEAM_STATS.TEAM_NAME == opp].iloc[0].DEF_RATING
-        return d / LEAGUE_DEF
-    except:
-        return 1.0
-
-# -----------------------------
-# MONTE CARLO
-# -----------------------------
-
-def simulate_points(mu_minutes, mu_ppm, ppm_sigma, line):
-
-    sims = 20000
-
-    min_sigma = max(2.5, mu_minutes * 0.12)
-
-    sim_minutes = np.random.normal(mu_minutes, min_sigma, sims)
-    sim_minutes = np.clip(sim_minutes, 5, 48)
-
-    sim_ppm = np.random.normal(mu_ppm, max(0.05, ppm_sigma), sims)
-    sim_ppm = np.clip(sim_ppm, 0.2, 2.5)
-
-    pts = sim_minutes * sim_ppm
-
-    prob_over = (pts > line).mean() * 100
-    mean_proj = pts.mean()
-    p10 = np.percentile(pts,10)
-    p90 = np.percentile(pts,90)
-
-    return prob_over, mean_proj, p10, p90
-
-# -----------------------------
-# PLAYER DATA
-# -----------------------------
-
-@st.cache_data(ttl=1800)
-def get_player_log(player_name):
-
-    pl = players.find_players_by_full_name(player_name)
-
+    pl = players.find_players_by_full_name(name)
     if not pl:
         return None
 
     pid = pl[0]["id"]
     df = playergamelog.PlayerGameLog(player_id=pid).get_data_frames()[0]
+
+    df["MIN"] = df["MIN"].apply(parse_min)
+    df = df.dropna(subset=["MIN"])
+
+    df = df.sort_values("GAME_DATE")
     return df
 
-# -----------------------------
+
+# -------------------------
+# MATCHUP ENGINE
+# -------------------------
+
+PACE = {
+    "IND":1.05,"ATL":1.05,"WAS":1.05,
+    "GSW":1.04,"LAL":1.03,
+    "NYK":0.96,"MIA":0.95,"CLE":0.95
+}
+
+DEF = {
+    "SAS":1.06,"CHA":1.05,"DET":1.05,
+    "MIN":0.94,"BOS":0.94,"NYK":0.95
+}
+
+def matchup_factor(team):
+    return PACE.get(team.upper(),1.0) * DEF.get(team.upper(),1.0)
+
+
+# -------------------------
+# FATIGUE
+# -------------------------
+
+def fatigue_factor(df):
+
+    if len(df) < 2:
+        return 1.0
+
+    d0 = pd.to_datetime(df.iloc[-1]["GAME_DATE"])
+    d1 = pd.to_datetime(df.iloc[-2]["GAME_DATE"])
+
+    if (d0-d1).days <= 1:
+        return 0.94
+
+    return 1.0
+
+
+# -------------------------
+# FEATURE PIPELINE
+# -------------------------
+
+def build_features(df):
+
+    df = df.copy()
+
+    df["USG_PROXY"] = df["FGA"] + 0.44*df["FTA"] + df["TOV"]
+
+    df["PTS_L3"] = df["PTS"].rolling(3).mean()
+    df["PTS_L5"] = df["PTS"].rolling(5).mean()
+    df["MIN_L5"] = df["MIN"].rolling(5).mean()
+    df["FGA_L5"] = df["FGA"].rolling(5).mean()
+
+    df["EFF"] = df["FGM"] + 0.5*df["FG3M"]
+
+    df = df.dropna()
+
+    FEATURES = [
+        "MIN",
+        "FGA",
+        "FG3A",
+        "FTA",
+        "USG_PROXY",
+        "PTS_L3",
+        "PTS_L5",
+        "MIN_L5",
+        "FGA_L5",
+        "EFF"
+    ]
+
+    return df, FEATURES
+
+
+# -------------------------
+# TRAIN + VALIDATE
+# -------------------------
+
+def train_model(df, features):
+
+    split = int(len(df)*0.8)
+
+    train = df.iloc[:split]
+    valid = df.iloc[split:]
+
+    X_train = train[features]
+    y_train = train["PTS"]
+
+    X_valid = valid[features]
+    y_valid = valid["PTS"]
+
+    model = RandomForestRegressor(
+        n_estimators=N_ESTIMATORS,
+        max_depth=7,
+        random_state=42
+    )
+
+    model.fit(X_train,y_train)
+
+    pred = model.predict(X_valid)
+    mae = mean_absolute_error(y_valid,pred)
+
+    return model, mae
+
+
+# -------------------------
+# NEXT GAME VECTOR
+# -------------------------
+
+def build_next_row(df, opp):
+
+    r = df.iloc[-1].copy()
+
+    r["USG_PROXY"] = r["FGA"] + 0.44*r["FTA"] + r["TOV"]
+
+    r["PTS_L3"] = df["PTS"].tail(3).mean()
+    r["PTS_L5"] = df["PTS"].tail(5).mean()
+    r["MIN_L5"] = df["MIN"].tail(5).mean()
+    r["FGA_L5"] = df["FGA"].tail(5).mean()
+
+    r["EFF"] = r["FGM"] + 0.5*r["FG3M"]
+
+    factor = matchup_factor(opp)
+
+    r["FGA"] *= factor
+    r["FG3A"] *= factor
+    r["FTA"] *= factor
+
+    return r
+
+
+# -------------------------
+# MONTE CARLO
+# -------------------------
+
+def simulate(mu, line, mae):
+
+    sims = 10000
+
+    sd = max(mae, mu*0.18)
+
+    pts = np.random.normal(mu, sd, sims)
+    pts = np.clip(pts,0,90)
+
+    prob = (pts > line).mean()
+
+    return prob, np.percentile(pts,10), np.percentile(pts,90)
+
+
+# -------------------------
 # UI
-# -----------------------------
+# -------------------------
 
-st.title("NBA Points Predictor — Advanced Model")
+st.title("NBA Production ML Points Model")
 
-rows = st.number_input("Broj igrača", 1, 20, 3)
+name = st.text_input("Player name")
+opp = st.text_input("Opponent (BOS)")
+line = st.number_input("Points line", value=20.5)
 
-inputs = []
+if st.button("Run Model"):
 
-for i in range(rows):
-    c1,c2,c3,c4 = st.columns(4)
+    df = load_player_log(name)
 
-    name = c1.text_input(f"Igrač {i+1}")
-    team = c2.text_input("Tim", key=f"team{i}")
-    opp  = c3.text_input("Protivnik", key=f"opp{i}")
-    line = c4.number_input("Granica", value=20.5, key=f"line{i}")
+    if df is None or len(df) < MIN_GAMES_REQUIRED:
+        st.write("Not enough games")
+        st.stop()
 
-    inputs.append((name,team,opp,line))
+    df, FEATURES = build_features(df)
 
-# -----------------------------
-# RUN
-# -----------------------------
+    model, mae = train_model(df, FEATURES)
 
-if st.button("Analiziraj"):
+    next_row = build_next_row(df, opp)
 
-    results = []
+    X = next_row[FEATURES].values.reshape(1,-1)
 
-    for name,team,opp,line in inputs:
+    base_pred = model.predict(X)[0]
 
-        if not name:
-            continue
+    fatigue = fatigue_factor(df)
 
-        try:
+    final_pred = base_pred * fatigue
 
-            log = get_player_log(name)
+    prob, p10, p90 = simulate(final_pred, line, mae)
 
-            if log is None or len(log) == 0:
-                st.warning(f"Nema podataka za {name}")
-                continue
+    confidence = max(0, 1 - mae/15)
 
-            log = safe_sort_log(log)
-            log["MIN"] = parse_minutes_col(log["MIN"])
+    st.write("Projection:", round(final_pred,1))
+    st.write("Model MAE:", round(mae,2))
+    st.write("Confidence:", round(confidence*100,1), "%")
+    st.write("Over %:", round(prob*100,1))
+    st.write("Range:", round(p10,1), "-", round(p90,1))
 
-            mu_minutes = predict_minutes(log)
-            mu_ppm, ppm_sigma = compute_ppm_features(log)
-
-            f_fat = fatigue_factor(log)
-            f_pace = pace_factor(team, opp)
-            f_def  = defense_factor(opp)
-
-            adj_ppm = mu_ppm * f_pace * f_def * f_fat
-
-            prob, proj, p10, p90 = simulate_points(
-                mu_minutes,
-                adj_ppm,
-                ppm_sigma,
-                line
-            )
-
-            conf = np.clip(100 - ppm_sigma*60, 40, 95)
-
-            results.append({
-                "Igrač": name,
-                "Linija": line,
-                "Projekcija": round(proj,1),
-                "P_over_pct": round(prob,1),
-                "P10": round(p10,1),
-                "P90": round(p90,1),
-                "Minutes_pred": round(mu_minutes,1),
-                "PPM_pred": round(adj_ppm,3),
-                "Confidence": round(conf,1)
-            })
-
-        except Exception as e:
-            st.error(f"Greška za {name}: {e}")
-            st.text(traceback.format_exc())
-
-    if results:
-
-        df = pd.DataFrame(results).sort_values("P_over_pct", ascending=False)
-
-        st.dataframe(df, use_container_width=True)
-
-        st.subheader("Signal")
-
-        for _, r in df.iterrows():
-
-            p_over = r["P_over_pct"]
-
-            if p_over >= 75:
-                tag = "🔥 STRONG OVER"
-            elif p_over >= 60:
-                tag = "✅ OVER lean"
-            elif p_over <= 40:
-                tag = "❌ UNDER lean"
-            else:
-                tag = "⚖️ No edge"
-
-            st.write(
-                f"{r['Igrač']}: {tag} ({p_over}%) — proj {r['Projekcija']} "
-                f"[{r['P10']}–{r['P90']}]"
-            )
+    if prob > 0.75:
+        st.success("STRONG OVER")
+    elif prob > 0.60:
+        st.info("LEAN OVER")
+    elif prob < 0.40:
+        st.warning("LEAN UNDER")
+    else:
+        st.write("NO EDGE")
