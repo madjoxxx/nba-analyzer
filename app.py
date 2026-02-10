@@ -4,45 +4,72 @@ from nba_api.stats.static import players
 
 from model_core import *
 
-st.title("NBA PTS PROP SCANNER — Advanced ML")
+st.title("NBA PTS PROP SCANNER — Box Mode")
 
 
 # -------------------------
-# SCAN INPUT
+# PLAYER FIND SAFE
 # -------------------------
 
-st.subheader("Scan list input")
+def safe_find_player(name):
 
-st.write("Format: Player Name,Line")
+    if not name or len(name) < 3:
+        return None
 
-text = st.text_area(
-"""
-Example:
-Jimmy Butler,21.5
-Jayson Tatum,27.5
-Jalen Brunson,24.5
-"""
-)
+    matches = players.find_players_by_full_name(name)
+
+    if not matches:
+        return None
+
+    return matches[0]["id"], matches[0]["full_name"]
+
 
 # -------------------------
-# SCAN MODE
+# INPUT BOXES
+# -------------------------
+
+st.subheader("Enter Players + Lines")
+
+cols = st.columns(2)
+
+inputs = []
+
+for i in range(5):
+
+    with cols[i % 2]:
+
+        pname = st.text_input(f"Player {i+1}", key=f"p{i}")
+        pline = st.number_input(
+            f"Line {i+1}",
+            value=20.5,
+            key=f"l{i}"
+        )
+
+        inputs.append((pname, pline))
+
+
+# -------------------------
+# RUN SCAN
 # -------------------------
 
 if st.button("RUN SCAN"):
 
-    lines = text.strip().split("\n")
-
     rows = []
 
-    for row in lines:
+    progress = st.progress(0)
+
+    for idx, (name, line) in enumerate(inputs):
+
+        progress.progress((idx+1)/len(inputs))
+
+        pid_data = safe_find_player(name)
+
+        if not pid_data:
+            continue
+
+        pid, real_name = pid_data
 
         try:
-
-            name, line = row.split(",")
-            line = float(line)
-
-            pl = players.find_players_by_full_name(name)[0]
-            pid = pl["id"]
 
             df = get_games(pid)
 
@@ -69,27 +96,33 @@ if st.button("RUN SCAN"):
             pick = "OVER" if over > 0.55 else "UNDER"
 
             rows.append({
-                "Player": name,
+                "Player": real_name,
                 "Line": line,
-                "Proj": round(pred,1),
+                "Projection": round(pred,1),
                 "Pick": pick,
                 "OverProb%": round(over*100,1),
                 "Edge": round(edge,1),
-                "Conf": conf,
-                "Vol": vol,
-                "Cons%": cons,
+                "Confidence": conf,
+                "Volatility": vol,
+                "Consistency%": cons,
                 "Stake": stake(edge, conf)
             })
 
         except:
             continue
 
-    out = pd.DataFrame(rows)
+    progress.empty()
 
-    if len(out) == 0:
-        st.warning("No valid players")
+    if len(rows) == 0:
+        st.error("No valid players found — check spelling")
     else:
-        out = out.sort_values("Conf", ascending=False)
 
-        st.subheader("Best Picks")
+        out = pd.DataFrame(rows)
+
+        out = out.sort_values(
+            "Confidence",
+            ascending=False
+        )
+
+        st.subheader("Scan Results")
         st.dataframe(out)
