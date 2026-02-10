@@ -1,27 +1,21 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 
-from nba_api.stats.endpoints import (
-    playergamelog,
-    commonallplayers
+from nba_api.stats.endpoints import playergamelog, commonallplayers
+
+from model_core import (
+    build_features,
+    baseline,
+    train_ml,
+    monte,
+    predict_minutes,
+    consistency_score,
+    backtest_hit_rate
 )
 
-# =========================
-# SAFE ML IMPORT
-# =========================
-
-ML_AVAILABLE = True
-try:
-    from sklearn.ensemble import RandomForestRegressor
-    from sklearn.model_selection import train_test_split
-except:
-    ML_AVAILABLE = False
-
-
-# =========================
-# CACHE DATA
-# =========================
+# =====================
+# DATA
+# =====================
 
 @st.cache_data(ttl=86400)
 def load_players():
@@ -31,241 +25,154 @@ def load_players():
 
 
 @st.cache_data(ttl=3600)
-def get_games(player_id):
+def get_games(pid):
     return playergamelog.PlayerGameLog(
-        player_id=player_id,
+        player_id=pid,
         season="2024-25"
     ).get_data_frames()[0]
 
 
-# =========================
-# FEATURES
-# =========================
+# =====================
+# PIPELINE
+# =====================
 
-def build_features(df):
+def run_full_model(pid, line):
 
-    df = df.sort_values("GAME_DATE")
-
-    df["PTS_r5"] = df["PTS"].rolling(5).mean()
-    df["PTS_r10"] = df["PTS"].rolling(10).mean()
-    df["MIN_r5"] = df["MIN"].rolling(5).mean()
-    df["USAGE"] = df["FGA"] + df["FTA"] * 0.44
-    df["HOME"] = df["MATCHUP"].str.contains("vs").astype(int)
-
-    df = df.dropna()
-
-    feats = ["PTS_r5", "PTS_r10", "MIN_r5", "USAGE", "HOME"]
-
-    return df[feats], df["PTS"]
-
-
-# =========================
-# BASELINE
-# =========================
-
-def baseline(df):
-    last5 = df["PTS"].tail(5)
-    return last5.mean(), last5.std()
-
-
-# =========================
-# ML TRAIN
-# =========================
-
-def train_ml(X, y):
-
-    Xtr, Xte, ytr, yte = train_test_split(
-        X, y, test_size=0.2, shuffle=False
-    )
-
-    model = RandomForestRegressor(
-        n_estimators=350,
-        max_depth=7,
-        random_state=42
-    )
-
-    model.fit(Xtr, ytr)
-
-    pred = model.predict(Xte)
-    mae = np.mean(np.abs(pred - yte))
-
-    return model, mae
-
-
-# =========================
-# MONTE CARLO
-# =========================
-
-def monte(mean, std, line):
-
-    sims = np.random.normal(mean, std, 12000)
-    over = np.mean(sims > line)
-
-    return over
-
-
-# =========================
-# PLAYER MODEL PIPELINE
-# =========================
-
-def run_model(player_id, line):
-
-    try:
-        df = get_games(player_id)
-    except:
-        return None
+    df = get_games(pid)
 
     if len(df) < 15:
         return None
 
     base_mean, base_std = baseline(df)
 
-    if ML_AVAILABLE:
+    X, y = build_features(df)
+    model, mae = train_ml(X, y)
 
-        X, y = build_features(df)
-        model, mae = train_ml(X, y)
+    if model:
         ml_pred = model.predict(X.iloc[-1:])[0]
-
     else:
         ml_pred = base_mean
-        mae = base_std
 
-    pred = ml_pred * 0.65 + base_mean * 0.35
+    minutes = predict_minutes(df)
 
-    over_prob = monte(pred, base_std, line)
+    minutes_factor = minutes / df["MIN"].tail(5).mean()
+
+    pred = (ml_pred*0.7 + base_mean*0.3) * minutes_factor
+
+    over = monte(pred, base_std, line)
 
     edge = pred - line
-    conf = max(0, 100 - mae * 3)
+
+    consistency = consistency_score(df)
+
+    hitrate = backtest_hit_rate(df, line)
+
+    confidence = max(0, 100 - mae*3)
+
+    score = edge*8 + over*40 + consistency*0.3 + confidence*0.2
+
+    if score > 85:
+        grade = "A"
+    elif score > 70:
+        grade = "B"
+    else:
+        grade = "C"
 
     return {
         "pred": pred,
-        "over": over_prob,
+        "over": over,
         "edge": edge,
-        "conf": conf
+        "conf": confidence,
+        "cons": consistency,
+        "hit": hitrate,
+        "grade": grade,
+        "score": score
     }
 
 
-# =========================
+# =====================
 # UI
-# =========================
+# =====================
 
-st.title("NBA ML Prop Finder")
+st.title("NBA LEVEL 4 PROP MODEL")
 
-players_df = load_players()
+players = load_players()
 
 mode = st.radio(
     "Mode",
-    ["Single Player", "Top Picks Scanner"]
+    ["Single", "Top Picks"]
 )
 
 line = st.number_input("Points Line", value=20.5)
 
 
-# =========================
-# SINGLE PLAYER MODE
-# =========================
+# =====================
+# SINGLE
+# =====================
 
-if mode == "Single Player":
+if mode == "Single":
 
     name = st.text_input("Player name")
 
-    filtered = players_df[
-        players_df["DISPLAY_FIRST_LAST"]
+    filt = players[
+        players["DISPLAY_FIRST_LAST"]
         .str.contains(name, case=False, na=False)
     ]
 
-    if len(filtered) > 0:
+    if len(filt) > 0:
 
         choice = st.selectbox(
-            "Select player",
-            filtered["DISPLAY_FIRST_LAST"].values
+            "Select",
+            filt["DISPLAY_FIRST_LAST"]
         )
 
         pid = int(
-            filtered[
-                filtered["DISPLAY_FIRST_LAST"] == choice
+            filt[
+                filt["DISPLAY_FIRST_LAST"] == choice
             ]["PERSON_ID"].values[0]
         )
 
-        if st.button("Run Prediction"):
+        if st.button("Run"):
 
-            r = run_model(pid, line)
+            r = run_full_model(pid, line)
 
-            if r is None:
-                st.error("Not enough data")
-            else:
-                st.subheader("Prediction")
-
-                st.write(f"Projected: {r['pred']:.2f}")
-                st.write(f"Over {line}: {r['over']*100:.1f}%")
-                st.write(f"Edge: {r['edge']:.2f}")
-                st.write(f"Confidence: {r['conf']:.1f}%")
-
-                if r["edge"] > 2:
-                    st.success("Strong Value")
-                elif r["edge"] > 0.7:
-                    st.warning("Small Value")
-                else:
-                    st.error("No Edge")
+            st.write(r)
 
 
-# =========================
-# TOP PICKS SCANNER
-# =========================
+# =====================
+# TOP PICKS
+# =====================
 
 else:
 
-    sample_size = st.slider(
-        "Number of players to scan",
-        10, 120, 40
-    )
+    n = st.slider("Players to scan", 20, 150, 60)
 
-    if st.button("Scan Players"):
+    if st.button("Scan"):
 
-        results = []
+        rows = []
 
-        sample = players_df.head(sample_size)
+        for row in players.head(n).itertuples():
 
-        progress = st.progress(0)
-
-        for i, row in enumerate(sample.itertuples()):
-
-            pid = row.PERSON_ID
-            name = row.DISPLAY_FIRST_LAST
-
-            r = run_model(pid, line)
+            r = run_full_model(row.PERSON_ID, line)
 
             if r and r["conf"] > 55:
 
-                results.append({
-                    "Player": name,
-                    "Proj": round(r["pred"], 1),
-                    "Over%": round(r["over"]*100, 1),
-                    "Edge": round(r["edge"], 2),
-                    "Conf": round(r["conf"], 1)
+                rows.append({
+                    "Player": row.DISPLAY_FIRST_LAST,
+                    "Proj": round(r["pred"],1),
+                    "Over%": round(r["over"]*100,1),
+                    "Edge": round(r["edge"],2),
+                    "Conf": round(r["conf"],1),
+                    "Cons": r["cons"],
+                    "HitRate": round(r["hit"]*100,1),
+                    "Grade": r["grade"]
                 })
 
-            progress.progress((i+1)/sample_size)
+        df = pd.DataFrame(rows)
 
-        if len(results) == 0:
-            st.error("No valid picks")
-        else:
+        df = df.sort_values(
+            ["Grade","Edge","Over%"],
+            ascending=False
+        )
 
-            df = pd.DataFrame(results)
-
-            df = df.sort_values(
-                ["Edge", "Over%"],
-                ascending=False
-            )
-
-            st.subheader("Top Picks")
-
-            st.dataframe(df.head(15))
-
-
-# =========================
-# FOOTER
-# =========================
-
-if not ML_AVAILABLE:
-    st.warning("Running fallback model — sklearn not installed")
+        st.dataframe(df.head(15))
