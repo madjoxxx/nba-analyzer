@@ -38,7 +38,7 @@ def get_games(pid):
 
 def run_full_model(pid, line):
 
-    df = get_games(pid)
+    df = get_games(pid).reset_index(drop=True)
 
     if len(df) < 15:
         return None
