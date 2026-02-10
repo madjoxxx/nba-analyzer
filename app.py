@@ -1,200 +1,168 @@
-from prop_engine import (
-    ensemble_prediction,
-    volatility_flag,
-    line_sensitivity,
-    bet_signal,
-    stake_size
-)
-
 import streamlit as st
 import pandas as pd
+from nba_api.stats.static import players
+from nba_api.stats.endpoints import playergamelog
 
-from nba_api.stats.endpoints import playergamelog, commonallplayers
+from model_core import *
 
-from model_core import (
-    build_features,
-    baseline,
-    train_ml,
-    monte,
-    predict_minutes,
-    consistency_score,
-    backtest_hit_rate
-)
+st.title("NBA Points ML Analyzer — Level 5")
 
-# =====================
-# DATA
-# =====================
 
-@st.cache_data(ttl=86400)
-def load_players():
-    return commonallplayers.CommonAllPlayers(
-        is_only_current_season=1
-    ).get_data_frames()[0]
+# -------------------------
+# PLAYER LOOKUP
+# -------------------------
 
+name = st.text_input("Player name")
+
+def find_player_id(name):
+
+    res = players.find_players_by_full_name(name)
+
+    if not res:
+        return None
+
+    return res[0]["id"]
+
+
+# -------------------------
+# LOAD DATA
+# -------------------------
 
 @st.cache_data(ttl=3600)
-def get_games(pid):
-    return playergamelog.PlayerGameLog(
+def load_games(pid):
+
+    gl = playergamelog.PlayerGameLog(
         player_id=pid,
         season="2024-25"
-    ).get_data_frames()[0]
+    )
+
+    df = gl.get_data_frames()[0]
+
+    if len(df) == 0:
+        return None
+
+    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
+    df = df.sort_values("GAME_DATE")
+
+    return df
 
 
-# =====================
-# PIPELINE
-# =====================
+# -------------------------
+# RUN MODEL
+# -------------------------
 
 def run_full_model(pid, line):
 
-    df = get_games(pid).reset_index(drop=True)
+    raw = load_games(pid)
 
-    if len(df) < 15:
+    if raw is None or len(raw) < 20:
         return None
 
-    base_mean, base_std = baseline(df)
+    df = build_features(raw)
 
-    X, y = build_features(df)
-    model, mae = train_ml(X, y)
+    if len(df) < 20:
+        return None
 
-    if model:
-        ml_pred = model.predict(X.iloc[-1:])[0]
-    else:
-        ml_pred = base_mean
+    model, feats = train_model(df)
 
-    pred = ensemble_prediction(ml_pred, base_mean)
+    if model is None:
+        return None
 
-    minutes = predict_minutes(df)
-    minutes_factor = minutes / df["MIN"].tail(5).mean()
+    pred = predict_next(df, model, feats)
 
-    pred *= minutes_factor
+    std = df["PTS"].tail(10).std()
+    if pd.isna(std):
+        std = 4
 
-    over = monte(pred, base_std, line)
+    over = prob_over(pred, line, std)
+
+    hitrate = backtest_hit_rate(df, line)
 
     edge = pred - line
 
-    consistency = consistency_score(df)
-    hitrate = backtest_hit_rate(df, line)
+    vol = float(std)
+    cons = float(df["PTS"].tail(10).std())
 
-    confidence = max(0, 100 - mae*3)
-
-    vol = volatility_flag(base_std)
-
-    signal = bet_signal(edge, over, confidence, consistency)
-
-    stake = stake_size(confidence, edge)
-
-    curve = line_sensitivity(pred, base_std, line)
+    conf = confidence_score(edge, over, hitrate, vol)
 
     return {
         "pred": pred,
         "over": over,
         "edge": edge,
-        "conf": confidence,
-        "cons": consistency,
-        "hit": hitrate,
+        "conf": conf,
+        "signal": signal_tag(over, edge),
+        "stake": stake_size(conf),
         "vol": vol,
-        "signal": signal,
-        "stake": stake,
-        "curve": curve
+        "cons": cons,
+        "curve": line_curve(pred, std)
     }
 
 
-# =====================
-# UI
-# =====================
+# -------------------------
+# SINGLE PLAYER MODE
+# -------------------------
 
-st.title("NBA LEVEL 4 PROP MODEL")
+line = st.number_input("Line", value=20.5)
 
-players = load_players()
+if st.button("RUN SINGLE"):
 
-mode = st.radio(
-    "Mode",
-    ["Single", "Top Picks"]
-)
+    pid = find_player_id(name)
 
-line = st.number_input("Points Line", value=20.5)
+    if not pid:
+        st.error("Player not found")
+    else:
 
+        r = run_full_model(pid, line)
 
-# =====================
-# SINGLE
-# =====================
-
-if mode == "Single":
-
-    name = st.text_input("Player name")
-
-    filt = players[
-        players["DISPLAY_FIRST_LAST"]
-        .str.contains(name, case=False, na=False)
-    ]
-
-    if len(filt) > 0:
-
-        choice = st.selectbox(
-            "Select",
-            filt["DISPLAY_FIRST_LAST"]
-        )
-
-        pid = int(
-            filt[
-                filt["DISPLAY_FIRST_LAST"] == choice
-            ]["PERSON_ID"].values[0]
-        )
-
-        if st.button("Run"):
-
-            r = run_full_model(pid, line)
+        if not r:
+            st.error("Not enough data")
+        else:
 
             st.subheader("Prediction")
 
-st.write(f"Projection: {r['pred']:.2f}")
-st.write(f"Over prob: {r['over']*100:.1f}%")
-st.write(f"Edge: {r['edge']:.2f}")
-st.write(f"Confidence: {r['conf']:.1f}%")
-st.write(f"Consistency: {r['cons']}")
-st.write(f"Volatility: {r['vol']}")
-st.write(f"Signal: {r['signal']}")
-st.write(f"Suggested Stake %: {r['stake']}")
+            st.write(f"Projection: {r['pred']:.2f}")
+            st.write(f"Over probability: {r['over']*100:.1f}%")
+            st.write(f"Edge: {r['edge']:.2f}")
+            st.write(f"Confidence: {r['conf']:.1f}%")
+            st.write(f"Signal: {r['signal']}")
+            st.write(f"Stake %: {r['stake']}")
 
-st.subheader("Line Sensitivity")
+            st.subheader("Line sensitivity")
 
-st.dataframe(pd.DataFrame(r["curve"]))
+            st.dataframe(pd.DataFrame(r["curve"]))
 
 
-# =====================
-# TOP PICKS
-# =====================
+# -------------------------
+# TOP PICKS MODE
+# -------------------------
 
-else:
+if st.button("TOP PICKS SAMPLE"):
 
-    n = st.slider("Players to scan", 20, 150, 60)
+    sample = players.get_players()[:25]
 
-    if st.button("Scan"):
+    rows = []
 
-        rows = []
+    for p in sample:
 
-        for row in players.head(n).itertuples():
+        pid = p["id"]
 
-            r = run_full_model(row.PERSON_ID, line)
+        r = run_full_model(pid, line)
 
-            if r and r["conf"] > 55:
+        if r:
 
-                rows.append({
-                    "Player": row.DISPLAY_FIRST_LAST,
-                    "Proj": round(r["pred"],1),
-                    "Over%": round(r["over"]*100,1),
-                    "Edge": round(r["edge"],2),
-                    "Conf": round(r["conf"],1),
-                    "Cons": r["cons"],
-                    "HitRate": round(r["hit"]*100,1),
-                    "Grade": r["grade"]
-                })
+            rows.append({
+                "Player": p["full_name"],
+                "Proj": round(r["pred"], 1),
+                "OverProb": round(r["over"], 2),
+                "Edge": round(r["edge"], 2),
+                "Conf": round(r["conf"], 1),
+                "Signal": r["signal"],
+                "Stake": r["stake"]
+            })
+
+    if rows:
 
         df = pd.DataFrame(rows)
+        df = df.sort_values("Conf", ascending=False)
 
-        df = df.sort_values(
-            ["Grade","Edge","Over%"],
-            ascending=False
-        )
-
-        st.dataframe(df.head(15))
+        st.dataframe(df)
