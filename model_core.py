@@ -122,10 +122,15 @@ def monte(mean, std, line):
 
 def backtest_hit_rate(df, line):
 
-    # sigurnosni reset indeksa
+    # zaštita — ako nešto fali u kolonama
+    if "PTS" not in df.columns:
+        return 0
+
+    # sortiraj + reset indeksa → ključni dio
     df = df.sort_values("GAME_DATE").reset_index(drop=True)
 
-    n = len(df)
+    pts = df["PTS"].to_numpy()
+    n = len(pts)
 
     if n < 15:
         return 0
@@ -133,15 +138,18 @@ def backtest_hit_rate(df, line):
     hits = 0
     tests = 0
 
-    # walk-forward
-    for split_idx in range(12, n - 1):
+    # walk-forward stabilna petlja
+    for i in range(12, n):
 
-        train = df.iloc[:split_idx]
-        test_game = df.iloc[split_idx]
+        hist = pts[:i]
 
-        proj = train["PTS"].tail(5).mean()
+        if len(hist) < 5:
+            continue
 
-        if test_game["PTS"] > line:
+        proj = hist[-5:].mean()
+        actual = pts[i]
+
+        if actual > line:
             hits += 1
 
         tests += 1
