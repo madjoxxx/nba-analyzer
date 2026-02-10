@@ -2,16 +2,15 @@ import streamlit as st
 import pandas as pd
 
 from nba_api.stats.static import players
-
 from model_core import *
 
 st.set_page_config(layout="wide")
 
-st.title("NBA PTS PROP — PRO SCANNER")
+st.title("NBA PTS PROP — AUTO PICK SCANNER")
 
 
 # -------------------------
-# CACHE PLAYER DB
+# CACHE PLAYERS
 # -------------------------
 
 @st.cache_data
@@ -20,10 +19,6 @@ def load_players():
 
 ALL_PLAYERS = load_players()
 
-
-# -------------------------
-# SAFE SEARCH
-# -------------------------
 
 def find_player_id(name):
 
@@ -37,10 +32,10 @@ def find_player_id(name):
 
 
 # -------------------------
-# INPUT UI
+# INPUT GRID
 # -------------------------
 
-st.subheader("Enter Players")
+st.subheader("Players + Lines")
 
 cols = st.columns(3)
 
@@ -55,10 +50,48 @@ for i in range(6):
 
 
 # -------------------------
-# RUN
+# QUALITY SCORE
 # -------------------------
 
-if st.button("RUN SCAN"):
+def quality_score(row):
+
+    score = 0
+
+    score += row["Confidence"] * 0.5
+    score += row["OverProb%"] * 0.3
+    score += min(row["Edge"]*10, 30) * 0.2
+
+    if row["Vol"] == "LOW":
+        score += 5
+
+    if row["Cons%"] > 70:
+        score += 5
+
+    return round(score,1)
+
+
+def classify(row):
+
+    if (
+        row["Confidence"] >= 65 and
+        row["Edge"] >= 2 and
+        row["OverProb%"] >= 60 and
+        row["Vol"] != "HIGH" and
+        row["Cons%"] >= 60
+    ):
+        return "ELITE"
+
+    if row["Confidence"] >= 60 and row["Edge"] >= 1.5:
+        return "PLAYABLE"
+
+    return "PASS"
+
+
+# -------------------------
+# RUN SCAN
+# -------------------------
+
+if st.button("RUN AUTO SCAN"):
 
     results = []
 
@@ -82,7 +115,6 @@ if st.button("RUN SCAN"):
         df = get_games(pid)
 
         if df is None or len(df) < 20:
-            st.warning(f"No data: {real_name}")
             continue
 
         pred, feats = project(df)
@@ -98,7 +130,7 @@ if st.button("RUN SCAN"):
 
         pick = "OVER" if over > 0.55 else "UNDER"
 
-        results.append({
+        row = {
             "Player": real_name,
             "Line": line,
             "Projection": round(pred,1),
@@ -109,17 +141,43 @@ if st.button("RUN SCAN"):
             "Vol": volatility(df),
             "Cons%": consistency(df),
             "Stake": stake(edge, conf)
-        })
+        }
+
+        row["Score"] = quality_score(row)
+        row["Tier"] = classify(row)
+
+        results.append(row)
 
     prog.empty()
 
-    if len(results) == 0:
+    if not results:
         st.error("No valid players processed")
+        st.stop()
+
+    df_out = pd.DataFrame(results)
+
+    elite = df_out[df_out["Tier"] == "ELITE"].sort_values("Score", ascending=False)
+    playable = df_out[df_out["Tier"] == "PLAYABLE"].sort_values("Score", ascending=False)
+    passed = df_out[df_out["Tier"] == "PASS"].sort_values("Score", ascending=False)
+
+
+    # -------------------------
+    # OUTPUT SECTIONS
+    # -------------------------
+
+    st.subheader("🟢 ELITE PICKS")
+    if len(elite):
+        st.dataframe(elite, use_container_width=True)
     else:
+        st.write("None")
 
-        out = pd.DataFrame(results)
 
-        out = out.sort_values("Confidence", ascending=False)
+    st.subheader("🟡 PLAYABLE PICKS")
+    if len(playable):
+        st.dataframe(playable, use_container_width=True)
+    else:
+        st.write("None")
 
-        st.subheader("Best Props")
-        st.dataframe(out, use_container_width=True)
+
+    with st.expander("🔴 FILTERED OUT"):
+        st.dataframe(passed, use_container_width=True)
