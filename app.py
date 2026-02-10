@@ -145,7 +145,20 @@ if mode == "Single":
 
             r = run_full_model(pid, line)
 
-            st.write(r)
+            st.subheader("Prediction")
+
+st.write(f"Projection: {r['pred']:.2f}")
+st.write(f"Over prob: {r['over']*100:.1f}%")
+st.write(f"Edge: {r['edge']:.2f}")
+st.write(f"Confidence: {r['conf']:.1f}%")
+st.write(f"Consistency: {r['cons']}")
+st.write(f"Volatility: {r['vol']}")
+st.write(f"Signal: {r['signal']}")
+st.write(f"Suggested Stake %: {r['stake']}")
+
+st.subheader("Line Sensitivity")
+
+st.dataframe(pd.DataFrame(r["curve"]))
 
 
 # =====================
