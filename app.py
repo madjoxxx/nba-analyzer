@@ -6,11 +6,11 @@ from model_core import *
 
 st.set_page_config(layout="wide")
 
-st.title("NBA PTS PROP — AUTO PICK SCANNER")
+st.title("NBA PTS PROP — PRO SCANNER (15 Player Mode)")
 
 
 # -------------------------
-# CACHE PLAYERS
+# CACHE PLAYER DB
 # -------------------------
 
 @st.cache_data
@@ -20,7 +20,14 @@ def load_players():
 ALL_PLAYERS = load_players()
 
 
+# -------------------------
+# SAFE FIND
+# -------------------------
+
 def find_player_id(name):
+
+    if not name:
+        return None
 
     name = name.lower().strip()
 
@@ -29,24 +36,6 @@ def find_player_id(name):
             return p["id"], p["full_name"]
 
     return None
-
-
-# -------------------------
-# INPUT GRID
-# -------------------------
-
-st.subheader("Players + Lines")
-
-cols = st.columns(3)
-
-inputs = []
-
-for i in range(6):
-
-    with cols[i % 3]:
-        pname = st.text_input(f"Player {i+1}", key=f"p{i}")
-        pline = st.number_input(f"Line {i+1}", value=20.5, key=f"l{i}")
-        inputs.append((pname, pline))
 
 
 # -------------------------
@@ -59,7 +48,7 @@ def quality_score(row):
 
     score += row["Confidence"] * 0.5
     score += row["OverProb%"] * 0.3
-    score += min(row["Edge"]*10, 30) * 0.2
+    score += min(row["Edge"] * 10, 30) * 0.2
 
     if row["Vol"] == "LOW":
         score += 5
@@ -67,7 +56,7 @@ def quality_score(row):
     if row["Cons%"] > 70:
         score += 5
 
-    return round(score,1)
+    return round(score, 1)
 
 
 def classify(row):
@@ -88,18 +77,47 @@ def classify(row):
 
 
 # -------------------------
+# INPUT GRID — 15 PLAYERS
+# -------------------------
+
+st.subheader("Enter up to 15 players")
+
+cols = st.columns(3)
+
+inputs = []
+
+for i in range(15):
+
+    with cols[i % 3]:
+
+        pname = st.text_input(
+            f"Player {i+1}",
+            key=f"p{i}"
+        )
+
+        pline = st.number_input(
+            f"Line {i+1}",
+            value=20.5,
+            key=f"l{i}"
+        )
+
+        inputs.append((pname, pline))
+
+
+# -------------------------
 # RUN SCAN
 # -------------------------
 
-if st.button("RUN AUTO SCAN"):
+if st.button("RUN AUTO SCAN (15)"):
 
     results = []
-
     prog = st.progress(0)
+
+    total = len(inputs)
 
     for i, (name, line) in enumerate(inputs):
 
-        prog.progress((i+1)/len(inputs))
+        prog.progress((i+1)/total)
 
         if not name or len(name) < 3:
             continue
@@ -112,41 +130,46 @@ if st.button("RUN AUTO SCAN"):
 
         pid, real_name = pid_data
 
-        df = get_games(pid)
+        try:
 
-        if df is None or len(df) < 20:
+            df = get_games(pid)
+
+            if df is None or len(df) < 20:
+                st.warning(f"No data: {real_name}")
+                continue
+
+            pred, feats = project(df)
+
+            if pred is None:
+                continue
+
+            over = prob_over(pred, line, feats)
+            hit = backtest(df, line)
+
+            conf = confidence(over, hit)
+            edge = pred - line
+
+            row = {
+                "Player": real_name,
+                "Line": line,
+                "Projection": round(pred,1),
+                "Pick": "OVER" if over > 0.55 else "UNDER",
+                "OverProb%": round(over*100,1),
+                "Edge": round(edge,1),
+                "Confidence": conf,
+                "Vol": volatility(df),
+                "Cons%": consistency(df),
+                "Stake": stake(edge, conf)
+            }
+
+            row["Score"] = quality_score(row)
+            row["Tier"] = classify(row)
+
+            results.append(row)
+
+        except Exception as e:
+            st.warning(f"Error for {real_name}")
             continue
-
-        pred, feats = project(df)
-
-        if pred is None:
-            continue
-
-        over = prob_over(pred, line, feats)
-        hit = backtest(df, line)
-
-        conf = confidence(over, hit)
-        edge = pred - line
-
-        pick = "OVER" if over > 0.55 else "UNDER"
-
-        row = {
-            "Player": real_name,
-            "Line": line,
-            "Projection": round(pred,1),
-            "Pick": pick,
-            "OverProb%": round(over*100,1),
-            "Edge": round(edge,1),
-            "Confidence": conf,
-            "Vol": volatility(df),
-            "Cons%": consistency(df),
-            "Stake": stake(edge, conf)
-        }
-
-        row["Score"] = quality_score(row)
-        row["Tier"] = classify(row)
-
-        results.append(row)
 
     prog.empty()
 
@@ -162,22 +185,14 @@ if st.button("RUN AUTO SCAN"):
 
 
     # -------------------------
-    # OUTPUT SECTIONS
+    # OUTPUT
     # -------------------------
 
     st.subheader("🟢 ELITE PICKS")
-    if len(elite):
-        st.dataframe(elite, use_container_width=True)
-    else:
-        st.write("None")
-
+    st.dataframe(elite, use_container_width=True)
 
     st.subheader("🟡 PLAYABLE PICKS")
-    if len(playable):
-        st.dataframe(playable, use_container_width=True)
-    else:
-        st.write("None")
-
+    st.dataframe(playable, use_container_width=True)
 
     with st.expander("🔴 FILTERED OUT"):
         st.dataframe(passed, use_container_width=True)
