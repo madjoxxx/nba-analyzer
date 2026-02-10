@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import difflib
 
 from nba_api.stats.static import players
 from model_core import *
@@ -25,7 +26,6 @@ ALL_PLAYERS = load_players()
 # -------------------------
 
     
-    import difflib
 
 def find_player_id(name):
 
