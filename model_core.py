@@ -1,182 +1,184 @@
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestRegressor
+from nba_api.stats.endpoints import playergamelog
 
 
 # -------------------------
-# FEATURE BUILDING
+# DATA
+# -------------------------
+
+def get_games(pid, season="2024-25"):
+    df = playergamelog.PlayerGameLog(
+        player_id=pid,
+        season=season
+    ).get_data_frames()[0]
+
+    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
+    df = df.sort_values("GAME_DATE").reset_index(drop=True)
+    return df
+
+
+# -------------------------
+# FEATURE ENGINEERING
 # -------------------------
 
 def build_features(df):
 
     df = df.copy()
 
-    df["pts_l5"] = df["PTS"].rolling(5).mean()
-    df["pts_l10"] = df["PTS"].rolling(10).mean()
-    df["min_l5"] = df["MIN"].rolling(5).mean()
+    df["PTS_L5"] = df["PTS"].rolling(5).mean()
+    df["PTS_L10"] = df["PTS"].rolling(10).mean()
 
-    df["pts_std10"] = df["PTS"].rolling(10).std()
-    df["trend"] = df["pts_l5"] - df["pts_l10"]
+    df["MIN_L5"] = df["MIN"].rolling(5).mean()
 
-    df["rest"] = df["GAME_DATE"].diff().dt.days.fillna(2)
+    df["HOME"] = df["MATCHUP"].str.contains("vs").astype(int)
 
-    df = df.dropna()
+    df["REST"] = df["GAME_DATE"].diff().dt.days.fillna(2)
 
-    return df
-
-
-# -------------------------
-# TRAIN ML
-# -------------------------
-
-def train_model(df):
-
-    feats = ["pts_l5", "pts_l10", "min_l5", "pts_std10", "trend", "rest"]
-
-    if len(df) < 25:
-        return None, None
-
-    X = df[feats]
-    y = df["PTS"]
-
-    model = RandomForestRegressor(
-        n_estimators=300,
-        max_depth=6,
-        random_state=42
+    df["FORM_WEIGHTED"] = (
+        df["PTS"].ewm(span=7).mean()
     )
 
-    model.fit(X, y)
-
-    return model, feats
+    return df.dropna().reset_index(drop=True)
 
 
 # -------------------------
-# PREDICT NEXT GAME
+# SIMPLE ML MODEL (no sklearn)
 # -------------------------
 
-def predict_next(df, model, feats):
+def train_linear_model(X, y):
 
-    last = df.iloc[-1]
+    X = np.c_[np.ones(len(X)), X]
+    w = np.linalg.pinv(X.T @ X) @ X.T @ y
+    return w
 
-    X = pd.DataFrame([last[feats]])
 
-    pred = model.predict(X)[0]
-
-    return pred
+def predict_linear(w, x):
+    x = np.r_[1, x]
+    return float(x @ w)
 
 
 # -------------------------
-# PROBABILITY ESTIMATE
+# PROJECTION
 # -------------------------
 
-def prob_over(pred, line, std):
+def project_points(df):
 
-    if std < 1:
-        std = 1
+    feats = build_features(df)
+
+    if len(feats) < 20:
+        return None
+
+    X = feats[[
+        "PTS_L5",
+        "PTS_L10",
+        "MIN_L5",
+        "HOME",
+        "REST"
+    ]].values
+
+    y = feats["PTS"].values
+
+    w = train_linear_model(X, y)
+
+    last = X[-1]
+
+    pred = predict_linear(w, last)
+
+    return pred, feats
+
+
+# -------------------------
+# PROBABILITY
+# -------------------------
+
+def prob_over(pred, line, df):
+
+    std = df["PTS"].std()
+
+    if std == 0 or np.isnan(std):
+        return 0.5
 
     z = (pred - line) / std
 
     p = 1 / (1 + np.exp(-z))
-
     return float(p)
 
 
 # -------------------------
-# BACKTEST HIT RATE SAFE
+# BACKTEST (safe)
 # -------------------------
 
 def backtest_hit_rate(df, line):
 
-    if len(df) < 20:
-        return 0.5
+    pts = df["PTS"].to_numpy()
+    n = len(pts)
 
-    tests = 0
+    if n < 15:
+        return 0
+
     hits = 0
+    tests = 0
 
-    for i in range(15, len(df)):
+    for i in range(12, n):
 
-        window = df.iloc[:i]
+        hist = pts[:i]
 
-        if len(window) < 15:
+        if len(hist) < 5:
             continue
 
-        avg = window["PTS"].tail(10).mean()
+        proj = hist[-5:].mean()
+        actual = pts[i]
 
-        if avg > line:
-            tests += 1
+        if actual > line:
+            hits += 1
 
-            if df.iloc[i]["PTS"] > line:
-                hits += 1
+        tests += 1
 
     if tests == 0:
-        return 0.5
+        return 0
 
     return hits / tests
 
 
 # -------------------------
-# CONFIDENCE ENGINE
+# CONFIDENCE
 # -------------------------
 
-def confidence_score(edge, prob, hitrate, vol):
+def confidence_score(over_prob, hitrate):
 
-    score = (
-        edge * 3
-        + (prob - 0.5) * 10
-        + (hitrate - 0.5) * 6
-        - vol * 0.15
+    return round(
+        (over_prob * 0.6 + hitrate * 0.4) * 100,
+        1
     )
 
-    return float(max(0, min(100, score * 10)))
+
+# -------------------------
+# VOLATILITY
+# -------------------------
+
+def volatility_label(df):
+
+    std = df["PTS"].std()
+
+    if std < 4:
+        return "LOW"
+    elif std < 8:
+        return "MED"
+    else:
+        return "HIGH"
 
 
 # -------------------------
-# TAGGING
+# STAKE SUGGESTION
 # -------------------------
 
-def signal_tag(prob, edge):
+def stake_size(edge, conf):
 
-    if prob > 0.72 and edge > 2:
-        return "ELITE"
-
-    if prob > 0.65:
-        return "STRONG"
-
-    if prob > 0.57:
-        return "LEAN"
-
-    return "PASS"
-
-
-def stake_size(conf):
-
-    if conf > 80:
-        return 3
-
-    if conf > 65:
+    if edge < 1:
+        return 0.5
+    if conf > 70:
         return 2
-
-    if conf > 55:
-        return 1
-
-    return 0.5
-
-
-# -------------------------
-# LINE CURVE
-# -------------------------
-
-def line_curve(pred, std):
-
-    out = []
-
-    for l in np.arange(pred - 5, pred + 6, 1):
-
-        p = prob_over(pred, l, std)
-
-        out.append({
-            "Line": round(l, 1),
-            "OverProb": round(p, 3)
-        })
-
-    return out
+    if conf > 60:
+        return 1.5
+    return 1
