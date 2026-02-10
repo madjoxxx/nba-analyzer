@@ -26,11 +26,34 @@ ALL_PLAYERS = load_players()
 
 def find_player_id(name):
 
+    
+    import difflib
+
+def find_player_id(name):
+
     if not name:
         return None
 
     name = name.lower().strip()
 
+    names = [p["full_name"] for p in ALL_PLAYERS]
+
+    matches = difflib.get_close_matches(
+        name,
+        names,
+        n=3,
+        cutoff=0.6
+    )
+
+    if matches:
+
+        best = matches[0]
+
+        for p in ALL_PLAYERS:
+            if p["full_name"] == best:
+                return p["id"], p["full_name"]
+
+    # partial fallback
     for p in ALL_PLAYERS:
         if name in p["full_name"].lower():
             return p["id"], p["full_name"]
