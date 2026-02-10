@@ -1,128 +1,125 @@
 import streamlit as st
 import pandas as pd
+
 from nba_api.stats.static import players
 
 from model_core import *
 
-st.title("NBA PTS PROP SCANNER — Box Mode")
+st.set_page_config(layout="wide")
+
+st.title("NBA PTS PROP — PRO SCANNER")
 
 
 # -------------------------
-# PLAYER FIND SAFE
+# CACHE PLAYER DB
 # -------------------------
 
-def safe_find_player(name):
+@st.cache_data
+def load_players():
+    return players.get_players()
 
-    if not name or len(name) < 3:
-        return None
-
-    matches = players.find_players_by_full_name(name)
-
-    if not matches:
-        return None
-
-    return matches[0]["id"], matches[0]["full_name"]
+ALL_PLAYERS = load_players()
 
 
 # -------------------------
-# INPUT BOXES
+# SAFE SEARCH
 # -------------------------
 
-st.subheader("Enter Players + Lines")
+def find_player_id(name):
 
-cols = st.columns(2)
+    name = name.lower().strip()
+
+    for p in ALL_PLAYERS:
+        if name in p["full_name"].lower():
+            return p["id"], p["full_name"]
+
+    return None
+
+
+# -------------------------
+# INPUT UI
+# -------------------------
+
+st.subheader("Enter Players")
+
+cols = st.columns(3)
 
 inputs = []
 
-for i in range(5):
+for i in range(6):
 
-    with cols[i % 2]:
-
+    with cols[i % 3]:
         pname = st.text_input(f"Player {i+1}", key=f"p{i}")
-        pline = st.number_input(
-            f"Line {i+1}",
-            value=20.5,
-            key=f"l{i}"
-        )
-
+        pline = st.number_input(f"Line {i+1}", value=20.5, key=f"l{i}")
         inputs.append((pname, pline))
 
 
 # -------------------------
-# RUN SCAN
+# RUN
 # -------------------------
 
 if st.button("RUN SCAN"):
 
-    rows = []
+    results = []
 
-    progress = st.progress(0)
+    prog = st.progress(0)
 
-    for idx, (name, line) in enumerate(inputs):
+    for i, (name, line) in enumerate(inputs):
 
-        progress.progress((idx+1)/len(inputs))
+        prog.progress((i+1)/len(inputs))
 
-        pid_data = safe_find_player(name)
+        if not name or len(name) < 3:
+            continue
+
+        pid_data = find_player_id(name)
 
         if not pid_data:
+            st.warning(f"Not found: {name}")
             continue
 
         pid, real_name = pid_data
 
-        try:
+        df = get_games(pid)
 
-            df = get_games(pid)
-
-            if len(df) < 25:
-                continue
-
-            pred, feats = project_points(df)
-
-            if pred is None:
-                continue
-
-            over = prob_over(pred, line, feats)
-
-            hit = backtest_hit_rate(df, line)
-
-            conf = confidence(over, hit)
-
-            edge = pred - line
-
-            vol = volatility(df)
-
-            cons = consistency(df)
-
-            pick = "OVER" if over > 0.55 else "UNDER"
-
-            rows.append({
-                "Player": real_name,
-                "Line": line,
-                "Projection": round(pred,1),
-                "Pick": pick,
-                "OverProb%": round(over*100,1),
-                "Edge": round(edge,1),
-                "Confidence": conf,
-                "Volatility": vol,
-                "Consistency%": cons,
-                "Stake": stake(edge, conf)
-            })
-
-        except:
+        if df is None or len(df) < 20:
+            st.warning(f"No data: {real_name}")
             continue
 
-    progress.empty()
+        pred, feats = project(df)
 
-    if len(rows) == 0:
-        st.error("No valid players found — check spelling")
+        if pred is None:
+            continue
+
+        over = prob_over(pred, line, feats)
+        hit = backtest(df, line)
+
+        conf = confidence(over, hit)
+        edge = pred - line
+
+        pick = "OVER" if over > 0.55 else "UNDER"
+
+        results.append({
+            "Player": real_name,
+            "Line": line,
+            "Projection": round(pred,1),
+            "Pick": pick,
+            "OverProb%": round(over*100,1),
+            "Edge": round(edge,1),
+            "Confidence": conf,
+            "Vol": volatility(df),
+            "Cons%": consistency(df),
+            "Stake": stake(edge, conf)
+        })
+
+    prog.empty()
+
+    if len(results) == 0:
+        st.error("No valid players processed")
     else:
 
-        out = pd.DataFrame(rows)
+        out = pd.DataFrame(results)
 
-        out = out.sort_values(
-            "Confidence",
-            ascending=False
-        )
+        out = out.sort_values("Confidence", ascending=False)
 
-        st.subheader("Scan Results")
-        st.dataframe(out)
+        st.subheader("Best Props")
+        st.dataframe(out, use_container_width=True)
