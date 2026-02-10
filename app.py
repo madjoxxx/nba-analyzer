@@ -1,11 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from nba_api.stats.endpoints import playergamelog
-
-# =========================
-# SAFE IMPORT ML
-# =========================
+from nba_api.stats.endpoints import playergamelog, teamgamelog
 
 ML_AVAILABLE = True
 
@@ -17,113 +13,146 @@ except:
 
 
 # =========================
-# DATA FETCH
+# DATA
 # =========================
 
 @st.cache_data(ttl=3600)
-def get_player_games(player_id, season="2024-25"):
-    df = playergamelog.PlayerGameLog(
+def get_player_games(player_id):
+    return playergamelog.PlayerGameLog(
         player_id=player_id,
-        season=season
+        season="2024-25"
     ).get_data_frames()[0]
-    return df
+
+
+@st.cache_data(ttl=3600)
+def get_team_games(team_id):
+    return teamgamelog.TeamGameLog(
+        team_id=team_id,
+        season="2024-25"
+    ).get_data_frames()[0]
 
 
 # =========================
-# FEATURE ENGINEERING
+# FEATURES
 # =========================
 
-def build_features(df):
+def add_features(df):
 
     df = df.sort_values("GAME_DATE")
 
     df["PTS_roll5"] = df["PTS"].rolling(5).mean()
     df["PTS_roll10"] = df["PTS"].rolling(10).mean()
     df["MIN_roll5"] = df["MIN"].rolling(5).mean()
-    df["FG3M_roll5"] = df["FG3M"].rolling(5).mean()
-    df["FGA_roll5"] = df["FGA"].rolling(5).mean()
+
+    df["USAGE_PROXY"] = df["FGA"] + df["FTA"] * 0.44
 
     df["HOME"] = df["MATCHUP"].str.contains("vs").astype(int)
 
     df = df.dropna()
 
-    features = [
+    feats = [
         "PTS_roll5",
         "PTS_roll10",
         "MIN_roll5",
-        "FG3M_roll5",
-        "FGA_roll5",
+        "USAGE_PROXY",
         "HOME"
     ]
 
-    X = df[features]
-    y = df["PTS"]
-
-    return X, y
+    return df[feats], df["PTS"]
 
 
 # =========================
-# FALLBACK MODEL
+# FALLBACK
 # =========================
 
-def fallback_prediction(df):
-
+def baseline(df):
     last5 = df["PTS"].tail(5)
-
-    mean = last5.mean()
-    std = last5.std()
-
-    return mean, std
+    return last5.mean(), last5.std()
 
 
 # =========================
-# ML TRAIN
+# ML
 # =========================
 
 def train_ml(X, y):
 
-    X_train, X_test, y_train, y_test = train_test_split(
+    Xtr, Xte, ytr, yte = train_test_split(
         X, y, test_size=0.2, shuffle=False
     )
 
     model = RandomForestRegressor(
-        n_estimators=300,
-        max_depth=6,
+        n_estimators=400,
+        max_depth=7,
         random_state=42
     )
 
-    model.fit(X_train, y_train)
+    model.fit(Xtr, ytr)
 
-    preds = model.predict(X_test)
-    mae = np.mean(np.abs(preds - y_test))
+    pred = model.predict(Xte)
+    mae = np.mean(np.abs(pred - yte))
 
     return model, mae
+
+
+# =========================
+# MATCHUP DEFENSE
+# =========================
+
+def defense_adjustment(team_id):
+
+    try:
+        tdf = get_team_games(team_id)
+
+        opp_pts = tdf["PTS"].tail(10).mean()
+
+        league_avg = 114
+
+        adj = opp_pts / league_avg
+
+        return adj
+
+    except:
+        return 1.0
+
+
+# =========================
+# PACE APPROX
+# =========================
+
+def pace_adjustment(df):
+
+    poss_proxy = df["FGA"] + df["FTA"] * 0.44 + df["TOV"]
+
+    pace = poss_proxy.tail(5).mean()
+
+    league = 100
+
+    return pace / league
 
 
 # =========================
 # MONTE CARLO
 # =========================
 
-def monte_carlo(mean, std, line, sims=10000):
+def monte(mean, std, line):
 
-    samples = np.random.normal(mean, std, sims)
+    sims = np.random.normal(mean, std, 12000)
 
-    over = np.mean(samples > line)
-    under = 1 - over
-
-    return over, under
+    over = np.mean(sims > line)
+    return over, 1-over
 
 
 # =========================
-# STREAMLIT UI
+# UI
 # =========================
 
-st.title("NBA Points ML Predictor")
+st.title("NBA Production ML Predictor")
 
 player_id = st.number_input("Player ID", value=203999)
+team_id = st.number_input("Opponent Team ID", value=1610612738)
 line = st.number_input("Points Line", value=24.5)
 
-if st.button("Run Prediction"):
+if st.button("Run"):
 
     df = get_player_games(player_id)
 
@@ -131,57 +160,63 @@ if st.button("Run Prediction"):
         st.error("Not enough games")
         st.stop()
 
-    # ---------- fallback baseline ----------
-    base_mean, base_std = fallback_prediction(df)
+    base_mean, base_std = baseline(df)
 
-    # ---------- ML ----------
+    # ----- ML -----
     if ML_AVAILABLE:
 
-        X, y = build_features(df)
-
+        X, y = add_features(df)
         model, mae = train_ml(X, y)
-
-        latest = X.iloc[-1:]
-        ml_pred = model.predict(latest)[0]
+        ml_pred = model.predict(X.iloc[-1:])[0]
 
     else:
         ml_pred = base_mean
         mae = base_std
 
-    # ---------- HYBRID ----------
-    hybrid = ml_pred * 0.7 + base_mean * 0.3
+    # ----- matchup -----
+    def_adj = defense_adjustment(team_id)
 
-    # ---------- monte carlo ----------
-    over, under = monte_carlo(hybrid, base_std, line)
+    # ----- pace -----
+    pace_adj = pace_adjustment(df)
 
-    # ---------- confidence ----------
-    confidence = max(0, 100 - mae * 3)
+    # ----- hybrid -----
+    pred = ml_pred * 0.65 + base_mean * 0.35
 
-    # =========================
-    # OUTPUT
-    # =========================
+    pred *= def_adj
+    pred *= pace_adj
+
+    # ----- monte carlo -----
+    over, under = monte(pred, base_std, line)
+
+    # ----- edge -----
+    edge = pred - line
+
+    # ----- confidence -----
+    conf = max(0, 100 - mae*3)
+
+    # ================= OUTPUT =================
 
     st.subheader("Prediction")
-
-    st.write(f"Baseline Avg (L5): {base_mean:.2f}")
-    st.write(f"ML Prediction: {ml_pred:.2f}")
-    st.write(f"Hybrid Prediction: {hybrid:.2f}")
+    st.write(f"Baseline: {base_mean:.2f}")
+    st.write(f"ML: {ml_pred:.2f}")
+    st.write(f"Adjusted: {pred:.2f}")
 
     st.subheader("Probabilities")
+    st.write(f"Over: {over*100:.1f}%")
+    st.write(f"Under: {under*100:.1f}%")
 
-    st.write(f"Over {line}: {over*100:.1f}%")
-    st.write(f"Under {line}: {under*100:.1f}%")
+    st.subheader("Edge Score")
+    st.write(f"{edge:.2f} pts")
+
+    if edge > 2:
+        st.success("Strong value")
+    elif edge > 0.7:
+        st.warning("Small value")
+    else:
+        st.error("No edge")
 
     st.subheader("Model Confidence")
-
-    st.write(f"{confidence:.1f}%")
-
-    if confidence > 70:
-        st.success("High confidence")
-    elif confidence > 55:
-        st.warning("Medium confidence")
-    else:
-        st.error("Low confidence")
+    st.write(f"{conf:.1f}%")
 
     if not ML_AVAILABLE:
-        st.warning("Running without sklearn — fallback mode active")
+        st.warning("Fallback mode — sklearn missing")
