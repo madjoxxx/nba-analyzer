@@ -61,30 +61,29 @@ def run_full_model(pid, line):
     else:
         ml_pred = base_mean
 
-    minutes = predict_minutes(df)
+    pred = ensemble_prediction(ml_pred, base_mean)
 
+    minutes = predict_minutes(df)
     minutes_factor = minutes / df["MIN"].tail(5).mean()
 
-    pred = (ml_pred*0.7 + base_mean*0.3) * minutes_factor
+    pred *= minutes_factor
 
     over = monte(pred, base_std, line)
 
     edge = pred - line
 
     consistency = consistency_score(df)
-
     hitrate = backtest_hit_rate(df, line)
 
     confidence = max(0, 100 - mae*3)
 
-    score = edge*8 + over*40 + consistency*0.3 + confidence*0.2
+    vol = volatility_flag(base_std)
 
-    if score > 85:
-        grade = "A"
-    elif score > 70:
-        grade = "B"
-    else:
-        grade = "C"
+    signal = bet_signal(edge, over, confidence, consistency)
+
+    stake = stake_size(confidence, edge)
+
+    curve = line_sensitivity(pred, base_std, line)
 
     return {
         "pred": pred,
@@ -93,8 +92,10 @@ def run_full_model(pid, line):
         "conf": confidence,
         "cons": consistency,
         "hit": hitrate,
-        "grade": grade,
-        "score": score
+        "vol": vol,
+        "signal": signal,
+        "stake": stake,
+        "curve": curve
     }
 
 
