@@ -24,8 +24,6 @@ ALL_PLAYERS = load_players()
 # SAFE FIND
 # -------------------------
 
-def find_player_id(name):
-
     
     import difflib
 
