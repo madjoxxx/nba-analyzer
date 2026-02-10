@@ -1,135 +1,95 @@
 import streamlit as st
 import pandas as pd
-
 from nba_api.stats.static import players
 
 from model_core import *
 
-
-st.title("NBA PTS ML Analyzer — Level 6")
-
-
-# -------------------------
-# PLAYER LOOKUP
-# -------------------------
-
-name = st.text_input("Player name")
-
-player_id = None
-
-if name:
-    matches = players.find_players_by_full_name(name)
-
-    if matches:
-        player_id = matches[0]["id"]
-        st.write("Player ID:", player_id)
-
-
-line = st.number_input("Points line", value=20.5)
+st.title("NBA PTS PROP SCANNER — Advanced ML")
 
 
 # -------------------------
-# SINGLE MODE
+# SCAN INPUT
 # -------------------------
 
-if st.button("RUN SINGLE"):
+st.subheader("Scan list input")
 
-    if not player_id:
-        st.warning("Enter player name")
-    else:
+st.write("Format: Player Name,Line")
 
-        df = get_games(player_id)
+text = st.text_area(
+"""
+Example:
+Jimmy Butler,21.5
+Jayson Tatum,27.5
+Jalen Brunson,24.5
+"""
+)
 
-        if len(df) < 20:
-            st.warning("Not enough games")
-        else:
+# -------------------------
+# SCAN MODE
+# -------------------------
+
+if st.button("RUN SCAN"):
+
+    lines = text.strip().split("\n")
+
+    rows = []
+
+    for row in lines:
+
+        try:
+
+            name, line = row.split(",")
+            line = float(line)
+
+            pl = players.find_players_by_full_name(name)[0]
+            pid = pl["id"]
+
+            df = get_games(pid)
+
+            if len(df) < 25:
+                continue
 
             pred, feats = project_points(df)
+
+            if pred is None:
+                continue
 
             over = prob_over(pred, line, feats)
 
             hit = backtest_hit_rate(df, line)
 
-            conf = confidence_score(over, hit)
+            conf = confidence(over, hit)
 
             edge = pred - line
 
-            vol = volatility_label(df)
+            vol = volatility(df)
 
-            stake = stake_size(edge, conf)
+            cons = consistency(df)
 
-            st.subheader("Prediction")
-
-            st.write("Projection:", round(pred,2))
-            st.write("Over probability:", round(over*100,1), "%")
-            st.write("Edge:", round(edge,2))
-            st.write("Confidence:", conf)
-            st.write("Volatility:", vol)
-            st.write("Stake %:", stake)
-
-            curve = []
-
-            for l in [line-2, line-1, line, line+1, line+2]:
-                curve.append({
-                    "Line": l,
-                    "OverProb": prob_over(pred, l, feats)
-                })
-
-            st.subheader("Line Sensitivity")
-            st.dataframe(pd.DataFrame(curve))
-
-
-# -------------------------
-# TOP PICKS
-# -------------------------
-
-if st.button("RUN TOP PICKS"):
-
-    sample = players.get_players()[:25]
-
-    rows = []
-
-    for p in sample:
-
-        try:
-
-            df = get_games(p["id"])
-
-            if len(df) < 20:
-                continue
-
-            pred, feats = project_points(df)
-
-            line_guess = df["PTS"].mean()
-
-            over = prob_over(pred, line_guess, feats)
-
-            hit = backtest_hit_rate(df, line_guess)
-
-            conf = confidence_score(over, hit)
-
-            edge = pred - line_guess
-
-            stake = stake_size(edge, conf)
+            pick = "OVER" if over > 0.55 else "UNDER"
 
             rows.append({
-                "Player": p["full_name"],
+                "Player": name,
+                "Line": line,
                 "Proj": round(pred,1),
-                "LineGuess": round(line_guess,1),
-                "OverProb": round(over*100,1),
+                "Pick": pick,
+                "OverProb%": round(over*100,1),
                 "Edge": round(edge,1),
                 "Conf": conf,
-                "Stake": stake
+                "Vol": vol,
+                "Cons%": cons,
+                "Stake": stake(edge, conf)
             })
 
         except:
             continue
 
-    df_out = pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
 
-    df_out = df_out.sort_values(
-        "Conf",
-        ascending=False
-    )
+    if len(out) == 0:
+        st.warning("No valid players")
+    else:
+        out = out.sort_values("Conf", ascending=False)
 
-    st.dataframe(df_out)
+        st.subheader("Best Picks")
+        st.dataframe(out)
