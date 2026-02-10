@@ -5,8 +5,16 @@ import numpy as np
 from nba_api.stats.endpoints import playergamelog
 from nba_api.stats.static import players
 
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_absolute_error
+# -------------------------
+# OPTIONAL ML IMPORT
+# -------------------------
+
+ML_AVAILABLE = True
+try:
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.metrics import mean_absolute_error
+except:
+    ML_AVAILABLE = False
 
 
 # -------------------------
@@ -14,7 +22,6 @@ from sklearn.metrics import mean_absolute_error
 # -------------------------
 
 MIN_GAMES_REQUIRED = 18
-N_ESTIMATORS = 400
 
 
 # -------------------------
@@ -43,8 +50,8 @@ def load_player_log(name):
 
     df["MIN"] = df["MIN"].apply(parse_min)
     df = df.dropna(subset=["MIN"])
-
     df = df.sort_values("GAME_DATE")
+
     return df
 
 
@@ -52,16 +59,8 @@ def load_player_log(name):
 # MATCHUP ENGINE
 # -------------------------
 
-PACE = {
-    "IND":1.05,"ATL":1.05,"WAS":1.05,
-    "GSW":1.04,"LAL":1.03,
-    "NYK":0.96,"MIA":0.95,"CLE":0.95
-}
-
-DEF = {
-    "SAS":1.06,"CHA":1.05,"DET":1.05,
-    "MIN":0.94,"BOS":0.94,"NYK":0.95
-}
+PACE = {"IND":1.05,"ATL":1.05,"WAS":1.05,"GSW":1.04,"LAL":1.03}
+DEF  = {"SAS":1.06,"CHA":1.05,"DET":1.05,"MIN":0.94,"BOS":0.94}
 
 def matchup_factor(team):
     return PACE.get(team.upper(),1.0) * DEF.get(team.upper(),1.0)
@@ -72,120 +71,123 @@ def matchup_factor(team):
 # -------------------------
 
 def fatigue_factor(df):
-
     if len(df) < 2:
         return 1.0
 
     d0 = pd.to_datetime(df.iloc[-1]["GAME_DATE"])
     d1 = pd.to_datetime(df.iloc[-2]["GAME_DATE"])
 
-    if (d0-d1).days <= 1:
-        return 0.94
-
-    return 1.0
+    return 0.94 if (d0-d1).days <= 1 else 1.0
 
 
 # -------------------------
-# FEATURE PIPELINE
+# FORMULA MODEL
+# -------------------------
+
+def formula_projection(df, opp):
+
+    mins = df["MIN"].tail(8)
+    pts = df["PTS"].tail(8)
+
+    mu_min = np.average(mins, weights=np.linspace(1.4,0.7,len(mins)))
+    ppm = np.average(pts/mins, weights=np.linspace(1.5,0.7,len(mins)))
+
+    proj = mu_min * ppm
+
+    proj *= matchup_factor(opp)
+    proj *= fatigue_factor(df)
+
+    return proj
+
+
+# -------------------------
+# FEATURE PIPELINE (ML)
 # -------------------------
 
 def build_features(df):
 
     df = df.copy()
 
-    df["USG_PROXY"] = df["FGA"] + 0.44*df["FTA"] + df["TOV"]
-
-    df["PTS_L3"] = df["PTS"].rolling(3).mean()
+    df["USG"] = df["FGA"] + 0.44*df["FTA"] + df["TOV"]
     df["PTS_L5"] = df["PTS"].rolling(5).mean()
     df["MIN_L5"] = df["MIN"].rolling(5).mean()
     df["FGA_L5"] = df["FGA"].rolling(5).mean()
 
-    df["EFF"] = df["FGM"] + 0.5*df["FG3M"]
-
     df = df.dropna()
 
-    FEATURES = [
-        "MIN",
-        "FGA",
-        "FG3A",
-        "FTA",
-        "USG_PROXY",
-        "PTS_L3",
-        "PTS_L5",
-        "MIN_L5",
-        "FGA_L5",
-        "EFF"
-    ]
+    FEATURES = ["MIN","FGA","FG3A","FTA","USG","PTS_L5","MIN_L5","FGA_L5"]
 
     return df, FEATURES
 
 
 # -------------------------
-# TRAIN + VALIDATE
+# ML TRAIN
 # -------------------------
 
-def train_model(df, features):
+def ml_projection(df, FEATURES, opp):
 
     split = int(len(df)*0.8)
 
     train = df.iloc[:split]
     valid = df.iloc[split:]
 
-    X_train = train[features]
-    y_train = train["PTS"]
-
-    X_valid = valid[features]
-    y_valid = valid["PTS"]
-
     model = RandomForestRegressor(
-        n_estimators=N_ESTIMATORS,
+        n_estimators=350,
         max_depth=7,
-        random_state=42
+        random_state=1
     )
 
-    model.fit(X_train,y_train)
+    model.fit(train[FEATURES], train["PTS"])
 
-    pred = model.predict(X_valid)
-    mae = mean_absolute_error(y_valid,pred)
+    pred = model.predict(valid[FEATURES])
+    mae = mean_absolute_error(valid["PTS"], pred)
 
-    return model, mae
+    row = df.iloc[-1].copy()
 
-
-# -------------------------
-# NEXT GAME VECTOR
-# -------------------------
-
-def build_next_row(df, opp):
-
-    r = df.iloc[-1].copy()
-
-    r["USG_PROXY"] = r["FGA"] + 0.44*r["FTA"] + r["TOV"]
-
-    r["PTS_L3"] = df["PTS"].tail(3).mean()
-    r["PTS_L5"] = df["PTS"].tail(5).mean()
-    r["MIN_L5"] = df["MIN"].tail(5).mean()
-    r["FGA_L5"] = df["FGA"].tail(5).mean()
-
-    r["EFF"] = r["FGM"] + 0.5*r["FG3M"]
+    row["USG"] = row["FGA"] + 0.44*row["FTA"] + row["TOV"]
+    row["PTS_L5"] = df["PTS"].tail(5).mean()
+    row["MIN_L5"] = df["MIN"].tail(5).mean()
+    row["FGA_L5"] = df["FGA"].tail(5).mean()
 
     factor = matchup_factor(opp)
+    row["FGA"] *= factor
+    row["FG3A"] *= factor
+    row["FTA"] *= factor
 
-    r["FGA"] *= factor
-    r["FG3A"] *= factor
-    r["FTA"] *= factor
+    X = row[FEATURES].values.reshape(1,-1)
 
-    return r
+    pred_next = model.predict(X)[0]
+
+    pred_next *= fatigue_factor(df)
+
+    return pred_next, mae
+
+
+# -------------------------
+# VARIANCE SCORE
+# -------------------------
+
+def variance_score(df):
+
+    last = df["PTS"].tail(12)
+
+    cv = last.std() / last.mean()
+
+    if cv < 0.25:
+        return "LOW"
+    if cv < 0.40:
+        return "MEDIUM"
+    return "HIGH"
 
 
 # -------------------------
 # MONTE CARLO
 # -------------------------
 
-def simulate(mu, line, mae):
+def simulate(mu, line, err):
 
-    sims = 10000
-
-    sd = max(mae, mu*0.18)
+    sims = 9000
+    sd = max(err, mu*0.2)
 
     pts = np.random.normal(mu, sd, sims)
     pts = np.clip(pts,0,90)
@@ -199,10 +201,10 @@ def simulate(mu, line, mae):
 # UI
 # -------------------------
 
-st.title("NBA Production ML Points Model")
+st.title("NBA Hybrid Production Model")
 
 name = st.text_input("Player name")
-opp = st.text_input("Opponent (BOS)")
+opp = st.text_input("Opponent")
 line = st.number_input("Points line", value=20.5)
 
 if st.button("Run Model"):
@@ -210,32 +212,34 @@ if st.button("Run Model"):
     df = load_player_log(name)
 
     if df is None or len(df) < MIN_GAMES_REQUIRED:
-        st.write("Not enough games")
+        st.write("Not enough data")
         st.stop()
 
-    df, FEATURES = build_features(df)
+    formula_pred = formula_projection(df, opp)
 
-    model, mae = train_model(df, FEATURES)
+    if ML_AVAILABLE:
 
-    next_row = build_next_row(df, opp)
+        df_ml, FEATURES = build_features(df)
+        ml_pred, mae = ml_projection(df_ml, FEATURES, opp)
 
-    X = next_row[FEATURES].values.reshape(1,-1)
+        final_pred = 0.6*ml_pred + 0.4*formula_pred
+        err = mae
 
-    base_pred = model.predict(X)[0]
+        st.write("Model: ML + Formula")
 
-    fatigue = fatigue_factor(df)
+    else:
 
-    final_pred = base_pred * fatigue
+        final_pred = formula_pred
+        err = df["PTS"].tail(10).std()
 
-    prob, p10, p90 = simulate(final_pred, line, mae)
+        st.write("Model: Formula fallback (no sklearn)")
 
-    confidence = max(0, 1 - mae/15)
+    prob, p10, p90 = simulate(final_pred, line, err)
 
     st.write("Projection:", round(final_pred,1))
-    st.write("Model MAE:", round(mae,2))
-    st.write("Confidence:", round(confidence*100,1), "%")
     st.write("Over %:", round(prob*100,1))
     st.write("Range:", round(p10,1), "-", round(p90,1))
+    st.write("Variance:", variance_score(df))
 
     if prob > 0.75:
         st.success("STRONG OVER")
