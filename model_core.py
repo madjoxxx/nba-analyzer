@@ -125,13 +125,17 @@ def backtest_hit_rate(df, line):
     hits = 0
     tests = 0
 
-    for i in range(12, len(df)-1):
+    if len(df) < 15:
+        return 0
 
-        window = df.iloc[:i]
+    for i in range(12, len(df)):
 
-        mean = window["PTS"].tail(5).mean()
+        train_window = df.iloc[:i]
+        test_game = df.iloc[i]
 
-        if window.iloc[i]["PTS"] > line:
+        mean = train_window["PTS"].tail(5).mean()
+
+        if test_game["PTS"] > line:
             hits += 1
 
         tests += 1
