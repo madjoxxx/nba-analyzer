@@ -9,11 +9,6 @@ st.set_page_config(layout="wide")
 
 st.title("NBA PTS PROP — ULTRA SCAN DESK")
 
-
-# -------------------------
-# LOAD PLAYERS
-# -------------------------
-
 @st.cache_data
 def load_players():
     return players.get_players()
@@ -21,10 +16,6 @@ def load_players():
 ALL_PLAYERS = load_players()
 PLAYER_NAMES = sorted([p["full_name"] for p in ALL_PLAYERS])
 
-
-# -------------------------
-# LOOKUP
-# -------------------------
 
 def get_player_by_name(name):
 
@@ -35,20 +26,15 @@ def get_player_by_name(name):
         if p["full_name"] == name:
             return p["id"], p["full_name"]
 
-    # fuzzy fallback
-    matches = difflib.get_close_matches(name, PLAYER_NAMES, n=1, cutoff=0.65)
+    m = difflib.get_close_matches(name, PLAYER_NAMES, n=1, cutoff=0.6)
 
-    if matches:
+    if m:
         for p in ALL_PLAYERS:
-            if p["full_name"] == matches[0]:
+            if p["full_name"] == m[0]:
                 return p["id"], p["full_name"]
 
     return None
 
-
-# -------------------------
-# SCORING
-# -------------------------
 
 def quality_score(row):
 
@@ -68,24 +54,28 @@ def quality_score(row):
 
 def classify(row):
 
+    # ELITE OVER
     if (
-        row["Confidence"] >= 65 and
-        abs(row["Edge"]) >= 2 and
-        row["Prob"] >= 60 and
-        row["Vol"] != "HIGH" and
-        row["Cons%"] >= 60
+        row["Pick"] == "OVER" and
+        row["Prob"] >= 62 and
+        row["Confidence"] >= 60 and
+        row["Edge"] >= 2
     ):
         return "ELITE"
 
-    if row["Confidence"] >= 58 and abs(row["Edge"]) >= 1.3:
+    # ELITE UNDER — FIX
+    if (
+        row["Pick"] == "UNDER" and
+        row["Prob"] >= 65 and
+        row["Edge"] <= -2
+    ):
+        return "ELITE"
+
+    if row["Confidence"] >= 55 and abs(row["Edge"]) >= 1.2:
         return "PLAYABLE"
 
     return "PASS"
 
-
-# -------------------------
-# INPUT GRID
-# -------------------------
 
 st.subheader("15 Player Ultra Scanner")
 
@@ -111,20 +101,11 @@ for i in range(15):
         inputs.append((pname, line))
 
 
-# -------------------------
-# RUN SCAN
-# -------------------------
-
 if st.button("RUN ULTRA SCAN"):
 
     results = []
-    prog = st.progress(0)
 
-    total = len(inputs)
-
-    for i, (name, line) in enumerate(inputs):
-
-        prog.progress((i+1)/total)
+    for name, line in inputs:
 
         if not name:
             continue
@@ -132,87 +113,68 @@ if st.button("RUN ULTRA SCAN"):
         pid_data = get_player_by_name(name)
 
         if not pid_data:
-            st.warning(f"Not found: {name}")
             continue
 
         pid, real_name = pid_data
 
-        try:
+        df = get_games(pid)
 
-            df = get_games(pid)
-
-            if df is None or len(df) < 20:
-                continue
-
-            pred, feats = project(df)
-
-            if pred is None:
-                continue
-
-            over_prob = prob_over(pred, line, feats)
-            under_prob = 1 - over_prob
-
-            hit = backtest(df, line)
-
-            conf = confidence(over_prob, hit)
-            edge = pred - line
-
-            pick = "OVER" if over_prob >= 0.5 else "UNDER"
-            prob = over_prob if pick == "OVER" else under_prob
-
-            row = {
-                "Player": real_name,
-                "Line": line,
-                "Proj": round(pred,1),
-                "Pick": pick,
-                "Prob": round(prob*100,1),
-                "Edge": round(edge,1),
-                "Confidence": conf,
-                "Vol": volatility(df),
-                "Cons%": consistency(df),
-                "Stake": stake(edge, conf)
-            }
-
-            row["Score"] = quality_score(row)
-            row["Tier"] = classify(row)
-
-            results.append(row)
-
-        except Exception as e:
+        if df is None:
             continue
 
-    prog.empty()
+        pred, feats = project(df)
+
+        if pred is None:
+            continue
+
+        over_prob = prob_over(pred, line, feats)
+        under_prob = 1 - over_prob
+
+        hit = backtest(df, line)
+
+        conf = confidence(over_prob, hit)
+        edge = pred - line
+
+        pick = "OVER" if over_prob >= 0.5 else "UNDER"
+        prob = over_prob if pick == "OVER" else under_prob
+
+        row = {
+            "Player": real_name,
+            "Line": line,
+            "Proj": round(pred,1),
+            "Pick": pick,
+            "Prob": round(prob*100,1),
+            "Edge": round(edge,1),
+            "Confidence": conf,
+            "Vol": volatility(df),
+            "Cons%": consistency(df),
+            "Stake": stake(edge, conf)
+        }
+
+        row["Score"] = quality_score(row)
+        row["Tier"] = classify(row)
+
+        results.append(row)
 
     if not results:
-        st.error("No valid players processed")
+        st.error("No valid players processed — try active rotation players")
         st.stop()
 
     df_out = pd.DataFrame(results)
 
+    elite_over = df_out[(df_out.Pick=="OVER") & (df_out.Tier=="ELITE")]
+    elite_under = df_out[(df_out.Pick=="UNDER") & (df_out.Tier=="ELITE")]
+    playable = df_out[df_out.Tier=="PLAYABLE"]
+    passed = df_out[df_out.Tier=="PASS"]
 
-    # -------------------------
-    # SPLIT OVER / UNDER
-    # -------------------------
+    st.subheader("🟢 ELITE OVER")
+    st.dataframe(elite_over)
 
-    elite_over = df_out[(df_out.Pick=="OVER") & (df_out.Tier=="ELITE")].sort_values("Score", ascending=False)
-    elite_under = df_out[(df_out.Pick=="UNDER") & (df_out.Tier=="ELITE")].sort_values("Score", ascending=False)
+    st.subheader("🔵 ELITE UNDER")
+    st.dataframe(elite_under)
 
-    playable = df_out[df_out.Tier=="PLAYABLE"].sort_values("Score", ascending=False)
-    passed = df_out[df_out.Tier=="PASS"].sort_values("Score", ascending=False)
+    st.subheader("🟡 PLAYABLE")
+    st.dataframe(playable)
 
-
-    # -------------------------
-    # OUTPUT UI
-    # -------------------------
-
-    st.subheader("🟢 ELITE OVER PICKS")
-    st.dataframe(elite_over, use_container_width=True)
-
-    st.subheader("🔵 ELITE UNDER PICKS")
-    st.dataframe(elite_under, use_container_width=True)
-
-    st.subheader("🟡 PLAYABLE PICKS")
-    st.dataframe(playable, use_container_width=True)
-
-    with st.expander("🔴 FILTERED OUT"):
-        st.dataframe(passed, use_container_width=True)
+    with st.expander("🔴 FILTERED"):
+        st.dataframe(passed)
