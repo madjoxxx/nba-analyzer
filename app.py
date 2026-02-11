@@ -1,158 +1,218 @@
 import streamlit as st
 import pandas as pd
+import difflib
+
 from nba_api.stats.static import players
-from model_core import run_model
+from model_core import *
 
 st.set_page_config(layout="wide")
 
-st.title("🏀 NBA AI Prop Engine — Ultra UI+")
+st.title("NBA PTS PROP — ULTRA SCAN DESK")
 
-# -----------------------------
-# LOAD PLAYER LIST
-# -----------------------------
+
+# -------------------------
+# LOAD PLAYERS
+# -------------------------
 
 @st.cache_data
 def load_players():
-    plist = players.get_players()
-    plist = sorted(plist, key=lambda x: x["full_name"])
-    names = [p["full_name"] for p in plist]
-    id_map = {p["full_name"]: p["id"] for p in plist}
-    return names, id_map
+    return players.get_players()
 
-PLAYER_NAMES, PLAYER_ID_MAP = load_players()
+ALL_PLAYERS = load_players()
+PLAYER_NAMES = sorted([p["full_name"] for p in ALL_PLAYERS])
 
-# -----------------------------
-# GRID INPUT — 15 ROWS
-# -----------------------------
 
-st.subheader("🔍 Player Scan Grid (Select — no typing errors)")
+# -------------------------
+# LOOKUP
+# -------------------------
 
-rows = []
+def get_player_by_name(name):
+
+    if not name:
+        return None
+
+    for p in ALL_PLAYERS:
+        if p["full_name"] == name:
+            return p["id"], p["full_name"]
+
+    # fuzzy fallback
+    matches = difflib.get_close_matches(name, PLAYER_NAMES, n=1, cutoff=0.65)
+
+    if matches:
+        for p in ALL_PLAYERS:
+            if p["full_name"] == matches[0]:
+                return p["id"], p["full_name"]
+
+    return None
+
+
+# -------------------------
+# SCORING
+# -------------------------
+
+def quality_score(row):
+
+    score = 0
+    score += row["Confidence"] * 0.45
+    score += row["Prob"] * 0.35
+    score += min(abs(row["Edge"]) * 12, 30) * 0.2
+
+    if row["Vol"] == "LOW":
+        score += 5
+
+    if row["Cons%"] > 70:
+        score += 5
+
+    return round(score,1)
+
+
+def classify(row):
+
+    if (
+        row["Confidence"] >= 65 and
+        abs(row["Edge"]) >= 2 and
+        row["Prob"] >= 60 and
+        row["Vol"] != "HIGH" and
+        row["Cons%"] >= 60
+    ):
+        return "ELITE"
+
+    if row["Confidence"] >= 58 and abs(row["Edge"]) >= 1.3:
+        return "PLAYABLE"
+
+    return "PASS"
+
+
+# -------------------------
+# INPUT GRID
+# -------------------------
+
+st.subheader("15 Player Ultra Scanner")
+
+cols = st.columns(3)
+inputs = []
 
 for i in range(15):
 
-    c1, c2, c3 = st.columns([3,1,2])
+    with cols[i % 3]:
 
-    name = c1.selectbox(
-        f"Player {i+1}",
-        [""] + PLAYER_NAMES,
-        key=f"p{i}"
-    )
+        pname = st.selectbox(
+            f"Player {i+1}",
+            [""] + PLAYER_NAMES,
+            key=f"p{i}"
+        )
 
-    line = c2.text_input("Line", key=f"l{i}")
-    opp = c3.text_input("Opponent (optional)", key=f"o{i}")
+        line = st.number_input(
+            f"PTS Line {i+1}",
+            value=20.5,
+            key=f"l{i}"
+        )
 
-    if name and line:
-        rows.append((name,line,opp))
+        inputs.append((pname, line))
 
-# -----------------------------
-# RUN BUTTON
-# -----------------------------
 
-if st.button("🚀 RUN SCAN"):
+# -------------------------
+# RUN SCAN
+# -------------------------
 
-    out = []
-    failed = []
+if st.button("RUN ULTRA SCAN"):
 
-    progress = st.progress(0)
-    total = len(rows)
+    results = []
+    prog = st.progress(0)
 
-    for idx, (name,line,opp) in enumerate(rows):
+    total = len(inputs)
 
-        progress.progress((idx+1)/max(total,1))
+    for i, (name, line) in enumerate(inputs):
 
-        try:
-            line = float(line)
-        except:
-            failed.append(name)
+        prog.progress((i+1)/total)
+
+        if not name:
             continue
 
-        pid = PLAYER_ID_MAP.get(name)
+        pid_data = get_player_by_name(name)
 
-        if not pid:
-            failed.append(name)
+        if not pid_data:
+            st.warning(f"Not found: {name}")
             continue
 
+        pid, real_name = pid_data
+
         try:
-            r = run_model(pid, line, opp_override=opp if opp else None)
+
+            df = get_games(pid)
+
+            if df is None or len(df) < 20:
+                continue
+
+            pred, feats = project(df)
+
+            if pred is None:
+                continue
+
+            over_prob = prob_over(pred, line, feats)
+            under_prob = 1 - over_prob
+
+            hit = backtest(df, line)
+
+            conf = confidence(over_prob, hit)
+            edge = pred - line
+
+            pick = "OVER" if over_prob >= 0.5 else "UNDER"
+            prob = over_prob if pick == "OVER" else under_prob
+
+            row = {
+                "Player": real_name,
+                "Line": line,
+                "Proj": round(pred,1),
+                "Pick": pick,
+                "Prob": round(prob*100,1),
+                "Edge": round(edge,1),
+                "Confidence": conf,
+                "Vol": volatility(df),
+                "Cons%": consistency(df),
+                "Stake": stake(edge, conf)
+            }
+
+            row["Score"] = quality_score(row)
+            row["Tier"] = classify(row)
+
+            results.append(row)
+
         except Exception as e:
-            failed.append(name)
             continue
 
-        if r:
-            r["Player"] = name
-            out.append(r)
-        else:
-            failed.append(name)
+    prog.empty()
 
-    progress.empty()
-
-    # -----------------------------
-    # FAIL INFO
-    # -----------------------------
-
-    if failed:
-        st.warning("⚠️ Not processed: " + ", ".join(failed))
-
-    if not out:
+    if not results:
         st.error("No valid players processed")
         st.stop()
 
-    df = pd.DataFrame(out)
+    df_out = pd.DataFrame(results)
 
-    # -----------------------------
-    # SORT CORE TABLE
-    # -----------------------------
 
-    df = df.sort_values("Edge", ascending=False)
+    # -------------------------
+    # SPLIT OVER / UNDER
+    # -------------------------
 
-    st.subheader("📊 All Results")
-    st.dataframe(df, use_container_width=True)
+    elite_over = df_out[(df_out.Pick=="OVER") & (df_out.Tier=="ELITE")].sort_values("Score", ascending=False)
+    elite_under = df_out[(df_out.Pick=="UNDER") & (df_out.Tier=="ELITE")].sort_values("Score", ascending=False)
 
-    # -----------------------------
-    # ELITE OVER PICKS
-    # -----------------------------
+    playable = df_out[df_out.Tier=="PLAYABLE"].sort_values("Score", ascending=False)
+    passed = df_out[df_out.Tier=="PASS"].sort_values("Score", ascending=False)
 
-    elite_over = df[df["PickType"]=="ELITE_OVER"]
 
-    st.subheader("🔥 Elite Over Picks")
+    # -------------------------
+    # OUTPUT UI
+    # -------------------------
 
-    if len(elite_over):
-        st.dataframe(
-            elite_over.sort_values("P_over_%", ascending=False),
-            use_container_width=True
-        )
-    else:
-        st.info("No elite over picks")
+    st.subheader("🟢 ELITE OVER PICKS")
+    st.dataframe(elite_over, use_container_width=True)
 
-    # -----------------------------
-    # ELITE UNDER PICKS
-    # -----------------------------
+    st.subheader("🔵 ELITE UNDER PICKS")
+    st.dataframe(elite_under, use_container_width=True)
 
-    elite_under = df[df["PickType"]=="ELITE_UNDER"]
+    st.subheader("🟡 PLAYABLE PICKS")
+    st.dataframe(playable, use_container_width=True)
 
-    st.subheader("🧊 Elite Under Picks")
-
-    if len(elite_under):
-        st.dataframe(
-            elite_under.sort_values("P_under_%", ascending=False),
-            use_container_width=True
-        )
-    else:
-        st.info("No elite under picks")
-
-    # -----------------------------
-    # BEST PICKS AUTO PANEL
-    # -----------------------------
-
-    st.subheader("⭐ Best Auto Picks")
-
-    best = df[
-        (df["PickType"].isin(["ELITE_OVER","ELITE_UNDER"])) &
-        (df["Edge"] >= 6)
-    ]
-
-    if len(best):
-        st.dataframe(best, use_container_width=True)
-    else:
-        st.info("No auto-qualified picks today")
+    with st.expander("🔴 FILTERED OUT"):
+        st.dataframe(passed, use_container_width=True)
