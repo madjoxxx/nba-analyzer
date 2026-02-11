@@ -1,222 +1,183 @@
 import numpy as np
 import pandas as pd
+
 from nba_api.stats.endpoints import playergamelog
+from sklearn.linear_model import LinearRegression
 
 
 # -------------------------
-# LOAD
+# LOAD GAMES
 # -------------------------
 
-def get_games(pid, season="2024-25"):
+def get_games(pid):
 
     try:
         df = playergamelog.PlayerGameLog(
             player_id=pid,
-            season=season
+            season="2024-25"
         ).get_data_frames()[0]
+
+        df = df.sort_values("GAME_DATE")
+
+        if len(df) < 15:
+            return None
+
+        return df
+
     except:
         return None
 
-    if df is None or len(df) == 0:
-        return None
-
-    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
-    df = df.sort_values("GAME_DATE").reset_index(drop=True)
-
-    df["OPP"] = df["MATCHUP"].str[-3:]
-
-    return df
-
 
 # -------------------------
-# OPPONENT FEATURES
-# -------------------------
-
-def opponent_features(df):
-
-    opp = df.iloc[-1]["OPP"]
-
-    vs = df[df["OPP"] == opp]
-
-    if len(vs) < 3:
-        return 0, 0
-
-    vs_avg = vs["PTS"].mean()
-    vs_l5 = vs["PTS"].tail(5).mean()
-
-    season_avg = df["PTS"].mean()
-
-    delta = vs_avg - season_avg
-
-    return vs_avg, delta
-
-
-# -------------------------
-# PACE VS OPP
-# -------------------------
-
-def pace_proxy(row):
-
-    return row["FGA"] + row["TOV"] + 0.44 * row["FTA"]
-
-
-# -------------------------
-# FEATURES
+# FEATURE ENGINE
 # -------------------------
 
 def build_features(df):
 
-    df = df.copy()
+    f = {}
 
-    df["PACE"] = df.apply(pace_proxy, axis=1)
+    f["pts_l5"] = df["PTS"].tail(5).mean()
+    f["pts_l10"] = df["PTS"].tail(10).mean()
+    f["pts_season"] = df["PTS"].mean()
 
-    df["PTS_L5"] = df["PTS"].rolling(5).mean()
-    df["PTS_L10"] = df["PTS"].rolling(10).mean()
+    # minutes model
+    f["min_l5"] = df["MIN"].tail(5).mean()
+    f["min_l10"] = df["MIN"].tail(10).mean()
+    f["min_trend"] = f["min_l5"] - f["min_l10"]
 
-    df["MIN_L5"] = df["MIN"].rolling(5).mean()
+    # usage proxy
+    f["fga_l5"] = df["FGA"].tail(5).mean()
+    f["fta_l5"] = df["FTA"].tail(5).mean()
 
-    df["USG"] = df["FGA"] + 0.44 * df["FTA"]
-    df["USG_L5"] = df["USG"].rolling(5).mean()
+    # shot volume score
+    f["shot_volume"] = f["fga_l5"] + f["fta_l5"] * 0.44
 
-    df["PACE_L5"] = df["PACE"].rolling(5).mean()
+    # efficiency
+    f["fg_pct"] = df["FG_PCT"].tail(10).mean()
 
-    df["HOME"] = df["MATCHUP"].str.contains("vs").astype(int)
+    # form regime
+    f["form_delta"] = f["pts_l5"] - f["pts_season"]
 
-    df["REST"] = df["GAME_DATE"].diff().dt.days.fillna(2)
+    # volatility
+    f["std_pts"] = df["PTS"].tail(10).std()
 
-    vs_avg, vs_delta = opponent_features(df)
-
-    df["OPP_AVG"] = vs_avg
-    df["OPP_DELTA"] = vs_delta
-
-    df = df.dropna().reset_index(drop=True)
-
-    if len(df) < 20:
-        return None
-
-    return df
-
-
-# -------------------------
-# ML
-# -------------------------
-
-def train(X, y):
-
-    X = np.c_[np.ones(len(X)), X]
-    w = np.linalg.pinv(X.T @ X) @ X.T @ y
-    return w
-
-
-def predict(w, x):
-
-    x = np.r_[1, x]
-    return float(x @ w)
+    return f
 
 
 # -------------------------
-# PROJECT
+# ML PROJECTION
 # -------------------------
 
 def project(df):
 
-    feats = build_features(df)
+    X = df[[
+        "MIN","FGA","FTA"
+    ]].tail(20)
 
-    if feats is None:
+    y = df["PTS"].tail(20)
+
+    if len(X) < 10:
         return None, None
 
-    cols = [
-        "PTS_L5",
-        "PTS_L10",
-        "MIN_L5",
-        "USG_L5",
-        "PACE_L5",
-        "HOME",
-        "REST",
-        "OPP_AVG",
-        "OPP_DELTA"
-    ]
+    model = LinearRegression()
+    model.fit(X, y)
 
-    X = feats[cols].values
-    y = feats["PTS"].values
+    feats = build_features(df)
 
-    w = train(X, y)
+    pred = model.predict([[
+        feats["min_l5"],
+        feats["fga_l5"],
+        feats["fta_l5"]
+    ]])[0]
 
-    pred = predict(w, X[-1])
+    # regime adjustment
+    pred += feats["form_delta"] * 0.4
 
-    return pred, feats
+    # minutes trend adjustment
+    pred += feats["min_trend"] * 0.3
+
+    # shot volume adjustment
+    pred += (feats["shot_volume"] - X["FGA"].mean()) * 0.2
+
+    return float(pred), feats
 
 
 # -------------------------
-# PROB
+# PROBABILITY
 # -------------------------
 
 def prob_over(pred, line, feats):
 
-    std = feats["PTS"].std()
+    sigma = max(feats["std_pts"], 4)
 
-    if std == 0:
-        return 0.5
+    z = (pred - line) / sigma
 
-    z = (pred - line) / std
+    p = 1 / (1 + np.exp(-z))
 
-    return float(1 / (1 + np.exp(-z)))
+    return float(p)
 
 
 # -------------------------
-# BACKTEST
+# BACKTEST SAFE
 # -------------------------
 
 def backtest(df, line):
 
-    pts = df["PTS"].to_numpy()
-
-    if len(pts) < 15:
+    if len(df) < 12:
         return 0.5
 
-    hits = 0
-    tests = 0
+    window = df.tail(12)
 
-    for i in range(12, len(pts)):
-        proj = pts[:i][-5:].mean()
-        if pts[i] > line:
-            hits += 1
-        tests += 1
+    hits = (window["PTS"] > line).sum()
 
-    return hits / tests if tests else 0.5
+    return hits / len(window)
 
 
 # -------------------------
-# METRICS
+# CONFIDENCE
+# -------------------------
+
+def confidence(p, hit):
+
+    return round(p*60 + hit*40, 1)
+
+
+# -------------------------
+# VOLATILITY
 # -------------------------
 
 def volatility(df):
 
-    s = df["PTS"].std()
-    if s < 4: return "LOW"
-    if s < 8: return "MED"
+    s = df["PTS"].tail(10).std()
+
+    if s < 5:
+        return "LOW"
+    if s < 9:
+        return "MED"
     return "HIGH"
 
 
 def consistency(df):
 
     m = df["PTS"].mean()
-    s = df["PTS"].std()
+    std = df["PTS"].std()
 
-    if m == 0:
-        return 0
+    if std == 0:
+        return 50
 
-    return round((1 - s/m)*100,1)
+    return round((1 - std/m) * 100,1)
 
 
-def confidence(over, hit):
-
-    return round((over*0.6 + hit*0.4)*100,1)
-
+# -------------------------
+# STAKE
+# -------------------------
 
 def stake(edge, conf):
 
-    if conf > 72 and edge > 2: return 2
-    if conf > 64: return 1.5
-    if conf > 58: return 1
-    return 0.5
+    if conf > 70 and abs(edge) > 3:
+        return 5
+    if conf > 65:
+        return 4
+    if conf > 58:
+        return 3
+    return 2
