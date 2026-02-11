@@ -1,262 +1,168 @@
 import numpy as np
 import pandas as pd
-
 from nba_api.stats.endpoints import playergamelog
-from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+
+# -----------------------------
+# TEAM DEF + PACE TABLE (proxy)
+# -----------------------------
+
+TEAM_DEF_RANK = {
+    "BOS": 4, "MIL": 7, "NYK": 9, "MIA": 6,
+    "LAL": 18, "DAL": 20, "ATL": 25, "IND": 27,
+    "SAS": 28, "UTA": 29, "WAS": 30
+}
+
+TEAM_PACE = {
+    "IND": 103, "ATL": 102, "SAS": 101,
+    "DAL": 99, "BOS": 98, "NYK": 96
+}
 
 
-# -------------------------
-# LOAD GAMES
-# -------------------------
+# -----------------------------
+# DATA
+# -----------------------------
 
 def get_games(pid):
+    gl = playergamelog.PlayerGameLog(player_id=pid)
+    df = gl.get_data_frames()[0]
 
-    try:
-        df = playergamelog.PlayerGameLog(
-            player_id=pid,
-            season="2024-25"
-        ).get_data_frames()[0]
+    df["HOME"] = df["MATCHUP"].apply(lambda x: 1 if "vs." in x else 0)
+    df["OPP"] = df["MATCHUP"].apply(lambda x: x.split()[-1])
 
-        df = df.sort_values("GAME_DATE")
+    df = df.sort_values("GAME_DATE")
+    df.reset_index(drop=True, inplace=True)
 
-        if len(df) < 15:
-            return None
-
-        return df
-
-    except:
-        return None
+    return df.tail(30)
 
 
-# -------------------------
-# OPPONENT PARSE
-# -------------------------
+# -----------------------------
+# FEATURES
+# -----------------------------
 
-def get_opponent(row):
-    # MATCHUP format: "LAL vs BOS" or "LAL @ BOS"
-    s = row["MATCHUP"]
-    return s.split()[-1]
+def add_features(df):
 
+    df["MIN_R5"] = df["MIN"].rolling(5).mean()
+    df["PTS_R5"] = df["PTS"].rolling(5).mean()
+    df["PTS_R10"] = df["PTS"].rolling(10).mean()
 
-# -------------------------
-# MATCHUP ENGINE
-# -------------------------
+    df["FGA_R5"] = df["FGA"].rolling(5).mean()
+    df["FG3A_R5"] = df["FG3A"].rolling(5).mean()
 
-def opponent_features(df):
+    df["VOL"] = df["PTS"].rolling(10).std()
 
-    df = df.copy()
-    df["OPP"] = df.apply(get_opponent, axis=1)
+    df["USAGE_PROXY"] = df["FGA_R5"] + df["FG3A_R5"] * 0.5
 
-    season_avg = df["PTS"].mean()
+    df["DEF_RANK"] = df["OPP"].map(TEAM_DEF_RANK).fillna(15)
+    df["PACE"] = df["OPP"].map(TEAM_PACE).fillna(100)
 
-    opp_table = df.groupby("OPP").agg({
-        "PTS":"mean",
-        "MIN":"mean",
-        "FGA":"mean",
-        "GAME_ID":"count"
-    }).reset_index()
+    df.dropna(inplace=True)
 
-    opp_table["pts_diff"] = opp_table["PTS"] - season_avg
-
-    return opp_table, season_avg
+    return df
 
 
-def opponent_adjustment(df):
+# -----------------------------
+# ML MODEL
+# -----------------------------
 
-    opp_table, season_avg = opponent_features(df)
+def train_model(df):
 
-    # recent opponents weight
-    recent = df.tail(5).copy()
-    recent["OPP"] = recent.apply(get_opponent, axis=1)
+    feats = [
+        "MIN_R5","PTS_R5","PTS_R10",
+        "FGA_R5","FG3A_R5",
+        "VOL","HOME",
+        "USAGE_PROXY","DEF_RANK","PACE"
+    ]
 
-    adj = 0
-    weight = 0
+    X = df[feats]
+    y = df["PTS"]
 
-    for opp in recent["OPP"]:
+    model = RandomForestRegressor(
+        n_estimators=200,
+        max_depth=6,
+        random_state=42
+    )
 
-        row = opp_table[opp_table["OPP"] == opp]
-
-        if len(row) == 0:
-            continue
-
-        diff = float(row["pts_diff"].iloc[0])
-        games = int(row["GAME_ID"].iloc[0])
-
-        sample_weight = min(games / 5, 1)
-
-        adj += diff * sample_weight
-        weight += sample_weight
-
-    if weight == 0:
-        return 0
-
-    return adj / weight
-
-
-# -------------------------
-# LINEUP FEATURES
-# -------------------------
-
-def lineup_features(df):
-
-    f = {}
-
-    min_l5 = df["MIN"].tail(5).mean()
-    min_l15 = df["MIN"].tail(15).mean()
-
-    fga_l5 = df["FGA"].tail(5).mean()
-    fga_l15 = df["FGA"].tail(15).mean()
-
-    f["minutes_spike"] = min_l5 - min_l15
-    f["usage_spike"] = fga_l5 - fga_l15
-
-    f["starter_flag"] = 1 if min_l5 >= 30 else 0
-    f["rotation_risk"] = df["MIN"].tail(10).std()
-
-    return f
-
-
-# -------------------------
-# FEATURE ENGINE
-# -------------------------
-
-def build_features(df):
-
-    f = {}
-
-    f["pts_l5"] = df["PTS"].tail(5).mean()
-    f["pts_l10"] = df["PTS"].tail(10).mean()
-    f["pts_season"] = df["PTS"].mean()
-
-    f["min_l5"] = df["MIN"].tail(5).mean()
-    f["fga_l5"] = df["FGA"].tail(5).mean()
-    f["fta_l5"] = df["FTA"].tail(5).mean()
-
-    f["shot_volume"] = f["fga_l5"] + f["fta_l5"] * 0.44
-    f["form_delta"] = f["pts_l5"] - f["pts_season"]
-
-    f["std_pts"] = df["PTS"].tail(10).std()
-
-    f.update(lineup_features(df))
-
-    f["opp_adj"] = opponent_adjustment(df)
-
-    return f
-
-
-# -------------------------
-# ML PROJECTION
-# -------------------------
-
-def project(df):
-
-    X = df[["MIN","FGA","FTA"]].tail(20)
-    y = df["PTS"].tail(20)
-
-    if len(X) < 10:
-        return None, None
-
-    model = LinearRegression()
     model.fit(X, y)
 
-    feats = build_features(df)
-
-    pred = model.predict([[
-        feats["min_l5"],
-        feats["fga_l5"],
-        feats["fta_l5"]
-    ]])[0]
-
-    # -------------------------
-    # ADJUSTMENTS STACK
-    # -------------------------
-
-    pred += feats["form_delta"] * 0.4
-    pred += feats["minutes_spike"] * 0.35
-    pred += feats["usage_spike"] * 0.6
-
-    # matchup adjustment
-    pred += feats["opp_adj"] * 0.7
-
-    if feats["starter_flag"]:
-        pred *= 1.05
-
-    if feats["rotation_risk"] > 8:
-        pred *= 0.94
-
-    return float(pred), feats
+    return model, feats
 
 
-# -------------------------
-# PROBABILITY
-# -------------------------
+# -----------------------------
+# PROBABILITY ENGINE
+# -----------------------------
 
-def prob_over(pred, line, feats):
+def calc_probs(pred, line, vol):
 
-    sigma = max(feats["std_pts"], 4)
+    if vol < 2:
+        vol = 2
 
-    z = (pred - line) / sigma
+    z = (pred - line) / vol
+    over = 1 / (1 + np.exp(-z))
+    under = 1 - over
 
-    return float(1 / (1 + np.exp(-z)))
-
-
-# -------------------------
-# BACKTEST
-# -------------------------
-
-def backtest(df, line):
-
-    w = df.tail(12)
-
-    if len(w) == 0:
-        return 0.5
-
-    return (w["PTS"] > line).mean()
+    return over*100, under*100
 
 
-# -------------------------
-# CONFIDENCE
-# -------------------------
+# -----------------------------
+# ELITE PICK CLASSIFIER — FIXED
+# -----------------------------
 
-def confidence(p, hit):
+def classify_pick(pred, line, over_p, under_p, edge):
 
-    return round(p*60 + hit*40, 1)
+    # ELITE OVER
+    if over_p >= 78 and edge >= 6 and pred >= line + 3:
+        return "ELITE_OVER"
 
+    # ELITE UNDER — FIXED LOGIC
+    if under_p >= 80 and edge >= 7 and pred <= line - 4:
+        return "ELITE_UNDER"
 
-# -------------------------
-# VOLATILITY
-# -------------------------
+    if over_p >= 60:
+        return "OVER"
 
-def volatility(df):
+    if under_p >= 60:
+        return "UNDER"
 
-    s = df["PTS"].tail(10).std()
-
-    if s < 5: return "LOW"
-    if s < 9: return "MED"
-    return "HIGH"
-
-
-def consistency(df):
-
-    m = df["PTS"].mean()
-    s = df["PTS"].std()
-
-    if m == 0:
-        return 50
-
-    return round((1 - s/m)*100,1)
+    return "PASS"
 
 
-# -------------------------
-# STAKE
-# -------------------------
+# -----------------------------
+# MAIN RUN
+# -----------------------------
 
-def stake(edge, conf):
+def run_model(pid, line, opp_override=None):
 
-    if conf > 70 and abs(edge) > 3:
-        return 5
-    if conf > 65:
-        return 4
-    if conf > 58:
-        return 3
-    return 2
+    df = get_games(pid)
+    df = add_features(df)
+
+    if len(df) < 12:
+        return None
+
+    if opp_override:
+        df.loc[df.index[-1], "OPP"] = opp_override
+
+    model, feats = train_model(df)
+
+    last = df.iloc[-1][feats]
+    pred = model.predict([last])[0]
+
+    vol = df["VOL"].iloc[-1]
+
+    over_p, under_p = calc_probs(pred, line, vol)
+
+    edge = abs(pred - line)
+
+    pick = classify_pick(pred, line, over_p, under_p, edge)
+
+    conf = min(0.95, (100-vol)/100)
+
+    return {
+        "Pred": round(pred,1),
+        "Line": line,
+        "P_over_%": round(over_p,1),
+        "P_under_%": round(under_p,1),
+        "Edge": round(edge,1),
+        "Confidence": round(conf,2),
+        "PickType": pick
+    }
