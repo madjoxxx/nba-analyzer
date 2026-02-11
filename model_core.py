@@ -29,7 +29,72 @@ def get_games(pid):
 
 
 # -------------------------
-# LINEUP + ROLE FEATURES
+# OPPONENT PARSE
+# -------------------------
+
+def get_opponent(row):
+    # MATCHUP format: "LAL vs BOS" or "LAL @ BOS"
+    s = row["MATCHUP"]
+    return s.split()[-1]
+
+
+# -------------------------
+# MATCHUP ENGINE
+# -------------------------
+
+def opponent_features(df):
+
+    df = df.copy()
+    df["OPP"] = df.apply(get_opponent, axis=1)
+
+    season_avg = df["PTS"].mean()
+
+    opp_table = df.groupby("OPP").agg({
+        "PTS":"mean",
+        "MIN":"mean",
+        "FGA":"mean",
+        "GAME_ID":"count"
+    }).reset_index()
+
+    opp_table["pts_diff"] = opp_table["PTS"] - season_avg
+
+    return opp_table, season_avg
+
+
+def opponent_adjustment(df):
+
+    opp_table, season_avg = opponent_features(df)
+
+    # recent opponents weight
+    recent = df.tail(5).copy()
+    recent["OPP"] = recent.apply(get_opponent, axis=1)
+
+    adj = 0
+    weight = 0
+
+    for opp in recent["OPP"]:
+
+        row = opp_table[opp_table["OPP"] == opp]
+
+        if len(row) == 0:
+            continue
+
+        diff = float(row["pts_diff"].iloc[0])
+        games = int(row["GAME_ID"].iloc[0])
+
+        sample_weight = min(games / 5, 1)
+
+        adj += diff * sample_weight
+        weight += sample_weight
+
+    if weight == 0:
+        return 0
+
+    return adj / weight
+
+
+# -------------------------
+# LINEUP FEATURES
 # -------------------------
 
 def lineup_features(df):
@@ -45,12 +110,8 @@ def lineup_features(df):
     f["minutes_spike"] = min_l5 - min_l15
     f["usage_spike"] = fga_l5 - fga_l15
 
-    # starter proxy
     f["starter_flag"] = 1 if min_l5 >= 30 else 0
-
-    # role stability
-    min_std = df["MIN"].tail(10).std()
-    f["rotation_risk"] = min_std
+    f["rotation_risk"] = df["MIN"].tail(10).std()
 
     return f
 
@@ -68,20 +129,17 @@ def build_features(df):
     f["pts_season"] = df["PTS"].mean()
 
     f["min_l5"] = df["MIN"].tail(5).mean()
-    f["min_l10"] = df["MIN"].tail(10).mean()
-
     f["fga_l5"] = df["FGA"].tail(5).mean()
     f["fta_l5"] = df["FTA"].tail(5).mean()
 
     f["shot_volume"] = f["fga_l5"] + f["fta_l5"] * 0.44
-
     f["form_delta"] = f["pts_l5"] - f["pts_season"]
 
     f["std_pts"] = df["PTS"].tail(10).std()
 
-    lf = lineup_features(df)
+    f.update(lineup_features(df))
 
-    f.update(lf)
+    f["opp_adj"] = opponent_adjustment(df)
 
     return f
 
@@ -92,10 +150,7 @@ def build_features(df):
 
 def project(df):
 
-    X = df[[
-        "MIN","FGA","FTA"
-    ]].tail(20)
-
+    X = df[["MIN","FGA","FTA"]].tail(20)
     y = df["PTS"].tail(20)
 
     if len(X) < 10:
@@ -113,19 +168,19 @@ def project(df):
     ]])[0]
 
     # -------------------------
-    # REGIME ADJUSTMENTS
+    # ADJUSTMENTS STACK
     # -------------------------
 
     pred += feats["form_delta"] * 0.4
-
     pred += feats["minutes_spike"] * 0.35
-
     pred += feats["usage_spike"] * 0.6
+
+    # matchup adjustment
+    pred += feats["opp_adj"] * 0.7
 
     if feats["starter_flag"]:
         pred *= 1.05
 
-    # rotation risk penalty
     if feats["rotation_risk"] > 8:
         pred *= 0.94
 
@@ -142,25 +197,21 @@ def prob_over(pred, line, feats):
 
     z = (pred - line) / sigma
 
-    p = 1 / (1 + np.exp(-z))
-
-    return float(p)
+    return float(1 / (1 + np.exp(-z)))
 
 
 # -------------------------
-# BACKTEST SAFE
+# BACKTEST
 # -------------------------
 
 def backtest(df, line):
 
-    if len(df) < 12:
-        return 0.5
-
     w = df.tail(12)
 
-    hits = (w["PTS"] > line).sum()
+    if len(w) == 0:
+        return 0.5
 
-    return hits / len(w)
+    return (w["PTS"] > line).mean()
 
 
 # -------------------------
@@ -169,9 +220,7 @@ def backtest(df, line):
 
 def confidence(p, hit):
 
-    base = p*60 + hit*40
-
-    return round(base,1)
+    return round(p*60 + hit*40, 1)
 
 
 # -------------------------
@@ -182,10 +231,8 @@ def volatility(df):
 
     s = df["PTS"].tail(10).std()
 
-    if s < 5:
-        return "LOW"
-    if s < 9:
-        return "MED"
+    if s < 5: return "LOW"
+    if s < 9: return "MED"
     return "HIGH"
 
 
