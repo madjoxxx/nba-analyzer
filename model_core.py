@@ -29,6 +29,33 @@ def get_games(pid):
 
 
 # -------------------------
+# LINEUP + ROLE FEATURES
+# -------------------------
+
+def lineup_features(df):
+
+    f = {}
+
+    min_l5 = df["MIN"].tail(5).mean()
+    min_l15 = df["MIN"].tail(15).mean()
+
+    fga_l5 = df["FGA"].tail(5).mean()
+    fga_l15 = df["FGA"].tail(15).mean()
+
+    f["minutes_spike"] = min_l5 - min_l15
+    f["usage_spike"] = fga_l5 - fga_l15
+
+    # starter proxy
+    f["starter_flag"] = 1 if min_l5 >= 30 else 0
+
+    # role stability
+    min_std = df["MIN"].tail(10).std()
+    f["rotation_risk"] = min_std
+
+    return f
+
+
+# -------------------------
 # FEATURE ENGINE
 # -------------------------
 
@@ -40,26 +67,21 @@ def build_features(df):
     f["pts_l10"] = df["PTS"].tail(10).mean()
     f["pts_season"] = df["PTS"].mean()
 
-    # minutes model
     f["min_l5"] = df["MIN"].tail(5).mean()
     f["min_l10"] = df["MIN"].tail(10).mean()
-    f["min_trend"] = f["min_l5"] - f["min_l10"]
 
-    # usage proxy
     f["fga_l5"] = df["FGA"].tail(5).mean()
     f["fta_l5"] = df["FTA"].tail(5).mean()
 
-    # shot volume score
     f["shot_volume"] = f["fga_l5"] + f["fta_l5"] * 0.44
 
-    # efficiency
-    f["fg_pct"] = df["FG_PCT"].tail(10).mean()
-
-    # form regime
     f["form_delta"] = f["pts_l5"] - f["pts_season"]
 
-    # volatility
     f["std_pts"] = df["PTS"].tail(10).std()
+
+    lf = lineup_features(df)
+
+    f.update(lf)
 
     return f
 
@@ -90,14 +112,22 @@ def project(df):
         feats["fta_l5"]
     ]])[0]
 
-    # regime adjustment
+    # -------------------------
+    # REGIME ADJUSTMENTS
+    # -------------------------
+
     pred += feats["form_delta"] * 0.4
 
-    # minutes trend adjustment
-    pred += feats["min_trend"] * 0.3
+    pred += feats["minutes_spike"] * 0.35
 
-    # shot volume adjustment
-    pred += (feats["shot_volume"] - X["FGA"].mean()) * 0.2
+    pred += feats["usage_spike"] * 0.6
+
+    if feats["starter_flag"]:
+        pred *= 1.05
+
+    # rotation risk penalty
+    if feats["rotation_risk"] > 8:
+        pred *= 0.94
 
     return float(pred), feats
 
@@ -126,11 +156,11 @@ def backtest(df, line):
     if len(df) < 12:
         return 0.5
 
-    window = df.tail(12)
+    w = df.tail(12)
 
-    hits = (window["PTS"] > line).sum()
+    hits = (w["PTS"] > line).sum()
 
-    return hits / len(window)
+    return hits / len(w)
 
 
 # -------------------------
@@ -139,7 +169,9 @@ def backtest(df, line):
 
 def confidence(p, hit):
 
-    return round(p*60 + hit*40, 1)
+    base = p*60 + hit*40
+
+    return round(base,1)
 
 
 # -------------------------
@@ -160,12 +192,12 @@ def volatility(df):
 def consistency(df):
 
     m = df["PTS"].mean()
-    std = df["PTS"].std()
+    s = df["PTS"].std()
 
-    if std == 0:
+    if m == 0:
         return 50
 
-    return round((1 - std/m) * 100,1)
+    return round((1 - s/m)*100,1)
 
 
 # -------------------------
